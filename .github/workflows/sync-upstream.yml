@@ -1,0 +1,58 @@
+name: Sync upstream for desktop
+
+on:
+  schedule:
+    - cron: '23 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: sync-upstream-desktop
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'cinnasulla/pdf2skill'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Merge upstream into a review branch
+        id: merge
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/CutePigdaddy/pdf2skill.git
+          git fetch upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo 'No new upstream commits.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git switch -C automation/sync-upstream
+          if ! git merge --no-edit upstream/main; then
+            git merge --abort
+            echo 'Upstream merge conflicts require manual resolution. Desktop branch was not changed.' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          git push --force-with-lease origin HEAD:automation/sync-upstream
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+      - name: Open or refresh synchronization PR
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh pr view automation/sync-upstream --json state --jq '.state' | grep -q '^OPEN$'; then
+            gh pr create --base main --head automation/sync-upstream --title 'Sync upstream pdf2skill into macOS desktop' --body 'Merge current upstream changes while preserving desktop packaging. The macOS Desktop workflow is dispatched on this branch to verify the DMG before merging. This PR never publishes a release automatically.'
+          fi
+      # GITHUB_TOKEN-created PRs do not trigger other workflows. Explicitly dispatch the build.
+      - name: Build the synchronization branch
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run macos-desktop.yml --ref automation/sync-upstream

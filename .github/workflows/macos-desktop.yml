@@ -1,0 +1,77 @@
+name: macOS Desktop
+
+on:
+  push:
+    branches: [main]
+    paths: ['desktop/**', 'packages/**', 'frontend/**', 'config/**', 'prompts/**', 'package*.json', '.github/workflows/macos-desktop.yml']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 35
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      # PR builds skip signing by default; this job uses ad-hoc signing only, no certificate secrets.
+      CSC_FOR_PULL_REQUEST: 'true'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            desktop/package-lock.json
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          architecture: arm64
+      - name: Verify native ARM64 runner
+        run: test "$(uname -m)" = arm64
+      - name: Build frontend and run SDK checks
+        run: |
+          npm ci
+          npm test
+          npm run build
+      - name: Freeze self-contained backend
+        run: |
+          python -m venv desktop/.venv
+          desktop/.venv/bin/python -m pip install -r desktop/requirements.txt
+          desktop/.venv/bin/python -m pip check
+          desktop/.venv/bin/python -m PyInstaller --noconfirm --distpath desktop/backend-dist --workpath desktop/backend-build desktop/backend.spec
+          desktop/.venv/bin/python -m pip freeze > desktop/backend-dist/python-dependencies.txt
+      - name: Build application and DMG
+        working-directory: desktop
+        run: |
+          npm ci
+          npm test
+          npm run dist
+      - name: Verify packaged application, persistence and cleanup
+        run: node desktop/test/smoke.cjs desktop/release/mac-arm64/pdf2skill.app/Contents/MacOS/pdf2skill
+      - name: Verify application signature and disk image
+        run: |
+          codesign --verify --deep --strict --verbose=2 desktop/release/mac-arm64/pdf2skill.app
+          hdiutil verify desktop/release/*.dmg
+          shasum -a 256 desktop/release/*.dmg > desktop/release/SHA256SUMS.txt
+          git rev-parse HEAD > desktop/release/SOURCE_COMMIT.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pdf2skill-macos-arm64
+          path: |
+            desktop/release/*.dmg
+            desktop/release/SHA256SUMS.txt
+            desktop/release/SOURCE_COMMIT.txt
+            desktop/backend-dist/python-dependencies.txt
+          if-no-files-found: error
+          retention-days: 30

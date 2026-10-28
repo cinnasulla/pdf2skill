@@ -1,0 +1,38 @@
+{
+  "name": "pdf2skill-desktop",
+  "productName": "pdf2skill",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-contained macOS desktop shell for pdf2skill",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.cjs",
+    "dist": "electron-builder --mac dmg --arm64 --publish never"
+  },
+  "devDependencies": {
+    "electron": "45.1.0",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "io.github.cinnasulla.pdf2skill",
+    "productName": "pdf2skill",
+    "directories": { "output": "release" },
+    "files": ["main.cjs", "paths.cjs", "package.json"],
+    "extraResources": [
+      { "from": "../packages/app/dist", "to": "web" },
+      { "from": "backend-dist/pdf2skill-backend", "to": "backend" }
+    ],
+    "mac": {
+      "category": "public.app-category.education",
+      "target": [{ "target": "dmg", "arch": ["arm64"] }],
+      "identity": "-",
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "extendInfo": { "LSMinimumSystemVersion": "13.0" }
+    },
+    "dmg": { "sign": false },
+    "artifactName": "pdf2skill-${version}-${arch}.${ext}",
+    "publish": null
+  }
+}
