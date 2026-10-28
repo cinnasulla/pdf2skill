@@ -10,7 +10,7 @@ const { assetPath, isolatedEnvironment } = require('./paths.cjs');
 
 const ORIGIN = 'pdf2skill://app';
 const BUNDLE_ID = 'io.github.cinnasulla.pdf2skill';
-const RELEASES = 'https://github.com/cinnasulla/pdf2skill/releases';
+const UPDATES_URL = 'https://github.com/cinnasulla/pdf2skill/actions/workflows/macos-desktop.yml';
 const smoke = process.argv.includes('--smoke-test');
 app.setName('pdf2skill');
 if (smoke && (!process.env.PDF2SKILL_TEST_DATA_DIR ||
@@ -176,7 +176,7 @@ function installMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate([
     { label: 'pdf2skill', submenu: [
       { role: 'about', label: '关于 pdf2skill' },
-      { label: '下载更新…', click: () => shell.openExternal(RELEASES) },
+      { label: '查看更新与安装包…', click: () => shell.openExternal(UPDATES_URL) },
       { type: 'separator' },
       { label: '打开应用数据目录', click: () => shell.openPath(dataRoot) },
       { label: '清除全部应用数据并退出…', click: cleanAndQuit },
