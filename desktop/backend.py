@@ -51,7 +51,9 @@ def main():
 
     # A closed parent pipe also shuts down the child after an Electron crash/SIGKILL.
     def parent_lifetime():
-        sys.stdin.buffer.read()
+        # Avoid holding BufferedReader's lock from a daemon during Python finalization.
+        while os.read(sys.stdin.fileno(), 4096):
+            pass
         os._exit(0)
 
     threading.Thread(target=parent_lifetime, daemon=True).start()

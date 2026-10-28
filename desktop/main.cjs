@@ -9,7 +9,8 @@ const readline = require('node:readline');
 const { assetPath, isolatedEnvironment } = require('./paths.cjs');
 
 const ORIGIN = 'pdf2skill://app';
-const RELEASES = 'https://github.com/cinnasulla/pdf2skill/releases';
+const BUNDLE_ID = 'io.github.cinnasulla.pdf2skill';
+const UPDATES_URL = 'https://github.com/cinnasulla/pdf2skill/actions/workflows/macos-desktop.yml';
 const smoke = process.argv.includes('--smoke-test');
 app.setName('pdf2skill');
 if (smoke && (!process.env.PDF2SKILL_TEST_DATA_DIR ||
@@ -151,10 +152,20 @@ async function cleanAndQuit(confirmed = false) {
   await stopBackend();
   await session.defaultSession.clearStorageData();
   await session.defaultSession.clearCache();
-  // Wait until Chromium releases all files; helper removes only this app's computed directory.
+  // Wait until Chromium releases all files; remove only fixed application-owned locations.
+  const library = path.join(app.getPath('home'), 'Library');
+  const cleanupTargets = [
+    path.join(library, 'Preferences', BUNDLE_ID + '.plist'),
+    path.join(library, 'Saved Application State', BUNDLE_ID + '.savedState'),
+    path.join(library, 'Caches', BUNDLE_ID),
+    path.join(library, 'HTTPStorages', BUNDLE_ID),
+    path.join(library, 'WebKit', BUNDLE_ID), dataRoot];
+  // defaults also invalidates cfprefsd's cached domain, preventing the plist from reappearing.
   const cleaner = spawn('/bin/sh', ['-c',
-    'while kill -0 "$1" 2>/dev/null; do /bin/sleep 0.2; done; /bin/rm -rf -- "$2"',
-    'pdf2skill-cleanup', String(process.pid), dataRoot], {
+    'while kill -0 "$1" 2>/dev/null; do /bin/sleep 0.2; done; ' +
+    '/usr/bin/defaults delete io.github.cinnasulla.pdf2skill >/dev/null 2>&1 || true; ' +
+    'shift; /bin/rm -rf -- "$@"',
+    'pdf2skill-cleanup', String(process.pid), ...cleanupTargets], {
     detached: true, stdio: 'ignore', cwd: '/', env: { PATH: '/usr/bin:/bin' }
   });
   cleaner.unref();
@@ -165,7 +176,7 @@ function installMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate([
     { label: 'pdf2skill', submenu: [
       { role: 'about', label: '关于 pdf2skill' },
-      { label: '下载更新…', click: () => shell.openExternal(RELEASES) },
+      { label: '查看更新与安装包…', click: () => shell.openExternal(UPDATES_URL) },
       { type: 'separator' },
       { label: '打开应用数据目录', click: () => shell.openPath(dataRoot) },
       { label: '清除全部应用数据并退出…', click: cleanAndQuit },

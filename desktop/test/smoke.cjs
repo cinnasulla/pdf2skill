@@ -27,6 +27,14 @@ async function main() {
           await new Promise(resolve => setTimeout(resolve, 100));
         }
         assert.equal(await fs.stat(root).catch(() => null), null, 'Cleanup must remove the entire app data root');
+        const domain = 'io.github.cinnasulla.pdf2skill';
+        for (const relative of [
+          `Preferences/${domain}.plist`, `Saved Application State/${domain}.savedState`,
+          `Caches/${domain}`, `HTTPStorages/${domain}`, `WebKit/${domain}`
+        ]) {
+          assert.equal(await fs.stat(path.join(os.homedir(), 'Library', relative)).catch(() => null), null,
+            `Cleanup must remove application-owned macOS data: ${relative}`);
+        }
         console.log('Application cleanup check passed');
         continue;
       }
