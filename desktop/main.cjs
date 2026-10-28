@@ -71,7 +71,10 @@ async function startBackend() {
   backend.on('exit', () => {
     if (!quitting && backendURL && !fatal) {
       fatal = true;
-      dialog.showErrorBox('后台已停止', '转换代理意外退出。请重新打开应用；未完成任务可在任务列表中恢复。');
+      if (smoke) {
+        fs.writeFileSync(path.join(dataRoot, 'smoke-error.txt'), 'Backend exited unexpectedly');
+        process.exitCode = 1;
+      } else dialog.showErrorBox('后台已停止', '转换代理意外退出。请重新打开应用；未完成任务可在任务列表中恢复。');
       app.quit();
     }
   });
@@ -195,6 +198,7 @@ async function smokeTest() {
     throw new Error('Desktop smoke checks failed: ' + JSON.stringify(report));
   }
   fs.writeFileSync(path.join(dataRoot, 'smoke-result.json'), JSON.stringify(report));
+  if (process.argv.includes('--smoke-crash-ready')) return;
   if (process.argv.includes('--smoke-cleanup')) await cleanAndQuit(true);
   else app.quit();
 }

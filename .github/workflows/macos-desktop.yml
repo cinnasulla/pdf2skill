@@ -2,10 +2,10 @@ name: macOS Desktop
 
 on:
   push:
-    branches: [main, feat/macos-desktop]
+    branches: [main]
     paths: ['desktop/**', 'packages/**', 'frontend/**', 'config/**', 'prompts/**', 'package*.json', '.github/workflows/macos-desktop.yml']
   pull_request:
-    branches: [main, feat/macos-desktop]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -21,6 +21,8 @@ jobs:
     timeout-minutes: 35
     env:
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      # PR builds skip signing by default; this job uses ad-hoc signing only, no certificate secrets.
+      CSC_FOR_PULL_REQUEST: 'true'
       PIP_DISABLE_PIP_VERSION_CHECK: '1'
     steps:
       - uses: actions/checkout@v5
@@ -63,7 +65,6 @@ jobs:
           hdiutil verify desktop/release/*.dmg
           shasum -a 256 desktop/release/*.dmg > desktop/release/SHA256SUMS.txt
           git rev-parse HEAD > desktop/release/SOURCE_COMMIT.txt
-          git log -1 --format='%H %s' --remotes=origin/main > desktop/release/UPSTREAM_COMMIT.txt
       - uses: actions/upload-artifact@v4
         with:
           name: pdf2skill-macos-arm64
@@ -71,7 +72,6 @@ jobs:
             desktop/release/*.dmg
             desktop/release/SHA256SUMS.txt
             desktop/release/SOURCE_COMMIT.txt
-            desktop/release/UPSTREAM_COMMIT.txt
             desktop/backend-dist/python-dependencies.txt
           if-no-files-found: error
           retention-days: 30
