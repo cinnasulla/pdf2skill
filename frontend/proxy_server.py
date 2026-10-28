@@ -40,7 +40,8 @@ from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-load_dotenv(Path(__file__).parent.parent / ".env")
+if not os.getenv("PDF2SKILL_DESKTOP_DATA"):
+    load_dotenv(Path(__file__).parent.parent / ".env")
 
 PROJECT_ROOT = Path(__file__).parent.parent
 SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.yaml"
