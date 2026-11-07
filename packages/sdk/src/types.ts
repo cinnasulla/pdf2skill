@@ -13,6 +13,10 @@ export interface ProviderConfig {
   chunking_model?: string;
   peeling_model?: string;
   skill_engine_model?: string;
+  /** OpenAI Chat Completions `reasoning_effort`; empty/absent = omit the field. */
+  chunking_reasoning_effort?: string;
+  peeling_reasoning_effort?: string;
+  skill_engine_reasoning_effort?: string;
 }
 
 export type StageRouter = 'chunking' | 'peeling' | 'skillEngine';
@@ -107,6 +111,12 @@ export interface RunResult {
   referenceCount: number;
 }
 
+/** A ready-to-install skill zip (SKILL.md + references at the archive root). */
+export interface SkillZipResult {
+  blob: Blob;
+  skillName: string;
+}
+
 // ── Jobs / storage ──────────────────────────────────────────────────
 
 export interface JobMeta {
@@ -114,6 +124,11 @@ export interface JobMeta {
   inputName: string;
   completedStages: StageName[];
   updatedAt: number;
+}
+
+export interface JobSummary extends JobMeta {
+  /** Stage 1 checkpoint exists and its markdown file is still present. */
+  resumable: boolean;
 }
 
 export interface OutputTreeNode {
@@ -141,9 +156,13 @@ export interface StageEvent {
   resumed?: boolean;
 }
 
+export type LogKind = 'stage' | 'run' | 'detail';
+
 export interface LogEvent {
   level: 'info' | 'warn' | 'error';
   message: string;
+  /** UI hint: stage divider, normal run message, or verbose detail. */
+  kind?: LogKind;
 }
 
 export type Pdf2SkillEvents = {

@@ -1,8 +1,14 @@
 import { Pdf2Skill, validateConfig } from '@pdf2skill/sdk';
-import type { ProviderConfig } from '@pdf2skill/sdk';
-import { fetchModels, getKeys, getProviders, setKey, syncProviders } from '../api/backend';
+import type {
+  MineruConfig,
+  PdfConfig,
+  ProviderConfig,
+  RoutersConfig,
+} from '@pdf2skill/sdk';
+import { fetchModels, getKeys, getServerConfig, saveServerConfig, setKey } from '../api/backend';
+import { enhanceModelInputs } from '../ui/combobox';
 import { $, checked, escapeHtml, errInfoOf, setChecked, setVal, showToast, val } from '../ui/dom';
-import { syncSelect } from '../ui/dropdown';
+import { enhanceSelects, syncSelect } from '../ui/dropdown';
 
 const STAGES: {
   selId: string;
@@ -15,9 +21,47 @@ const STAGES: {
   { selId: 'skill-provider', stageKey: 'skill_engine', routerKey: 'skillEngine', displayId: 'skill-model-display' },
 ];
 const MODEL_KEYS = ['chunking_model', 'peeling_model', 'skill_engine_model'] as const;
+const EFFORT_KEYS = {
+  chunking_model: 'chunking_reasoning_effort',
+  peeling_model: 'peeling_reasoning_effort',
+  skill_engine_model: 'skill_engine_reasoning_effort',
+} as const;
+const REASONING_KEYS = [
+  'chunking_reasoning_effort',
+  'peeling_reasoning_effort',
+  'skill_engine_reasoning_effort',
+] as const;
+
+// OpenAI Chat Completions reasoning_effort presets. Which levels a model
+// accepts varies by model/provider; the empty value omits the field.
+const EFFORT_OPTIONS: { value: string; label: string }[] = [
+  { value: '', label: '默认（不发送）' },
+  { value: 'none', label: 'none · 关闭' },
+  { value: 'minimal', label: 'minimal · 最少' },
+  { value: 'low', label: 'low · 低' },
+  { value: 'medium', label: 'medium · 中' },
+  { value: 'high', label: 'high · 高' },
+  { value: 'xhigh', label: 'xhigh · 很高' },
+  { value: 'max', label: 'max · 最高' },
+];
+
+function effortOptionsHtml(current: string): string {
+  const custom =
+    current && !EFFORT_OPTIONS.some((o) => o.value === current)
+      ? `<option value="${escapeHtml(current)}" selected>${escapeHtml(current)}（自定义）</option>`
+      : '';
+  return (
+    custom +
+    EFFORT_OPTIONS.map(
+      (o) =>
+        `<option value="${o.value}"${o.value === current ? ' selected' : ''}>${escapeHtml(o.label)}</option>`,
+    ).join('')
+  );
+}
 
 let mineruMode: 'local' | 'remote' = 'local';
 const modelCache = new Map<string, string[]>();
+const pendingDeletes = new Set<string>();
 let keyStatus: Record<string, { api_key_env: string; api_key_set: boolean; api_key_preview: string }> = {};
 
 let pdf2skill: Pdf2Skill;
@@ -56,12 +100,17 @@ function renderProviderRows(): void {
       const badge = info.api_key_set
         ? `<span class="key-badge key-set"><i class="ph ph-check"></i>${escapeHtml(info.api_key_preview || '已设置')}</span>`
         : `<span class="key-badge key-missing"><i class="ph ph-x"></i>未设置 Key</span>`;
-      const modelFields = MODEL_KEYS.map(
-        (k) =>
+      const modelFields = MODEL_KEYS.map((k) => {
+        const effortKey = EFFORT_KEYS[k];
+        return (
           `<div class="pf-field"><label>${escapeHtml(k.replace('_model', ''))} 模型</label>` +
           `<input type="text" data-field="${k}" list="dl-${escapeHtml(name)}-${k}" value="${escapeHtml(cfg[k] || '')}" placeholder="未配置">` +
-          `<datalist id="dl-${escapeHtml(name)}-${k}"></datalist></div>`,
-      ).join('');
+          `<datalist id="dl-${escapeHtml(name)}-${k}"></datalist>` +
+          `<label class="pf-sub-label" for="eff-${escapeHtml(name)}-${k}">思考强度</label>` +
+          `<select id="eff-${escapeHtml(name)}-${k}" data-field="${effortKey}" title="OpenAI Chat Completions reasoning_effort；不同模型支持的档位不同">` +
+          `${effortOptionsHtml(cfg[effortKey] || '')}</select></div>`
+        );
+      }).join('');
       return `
     <div class="provider-row" data-provider="${escapeHtml(name)}">
       <div class="provider-head">
@@ -91,6 +140,8 @@ function renderProviderRows(): void {
   });
 
   for (const [name, models] of modelCache) renderDatalists(name, models);
+  enhanceModelInputs(container);
+  enhanceSelects(container);
 }
 
 function renderDatalists(providerName: string, models: string[]): void {
@@ -211,10 +262,11 @@ async function saveNewProvider(): Promise<void> {
 
   const cfg = sdk().getConfig();
   cfg.providers[name] = candidate;
+  pendingDeletes.delete(name);
   sdk().configure({ providers: cfg.providers });
   hideAddProviderForm();
   await loadConfigUI();
-  showToast('Provider 已保存（记得点「保存配置」或「同步到服务端」）');
+  showToast('Provider 已添加（点「保存配置」写入服务端）');
 }
 
 async function deleteProvider(name: string): Promise<void> {
@@ -237,9 +289,10 @@ async function deleteProvider(name: string): Promise<void> {
     }
   }
   delete cfg.providers[name];
+  pendingDeletes.add(name);
   sdk().configure({ providers: cfg.providers });
   await loadConfigUI();
-  showToast(`已删除 Provider ${name}`);
+  showToast(`已删除 Provider ${name}（点「保存配置」写入服务端）`);
 }
 
 // ── MinerU mode ───────────────────────────────────────────────────
@@ -347,7 +400,7 @@ async function applySetKey(envVar: string, input: HTMLInputElement): Promise<voi
     await setKey(envVar, input.value);
     input.value = '';
     modelCache.clear();
-    showToast('Key 已设置');
+    showToast('Key 已写入 .env 并生效');
     await loadKeyStatus();
   } catch (e) {
     showSaveError(e);
@@ -359,9 +412,11 @@ function gatherProvidersFromUI(): Record<string, Record<string, string>> {
   document.querySelectorAll<HTMLElement>('.provider-row').forEach((row) => {
     const name = row.dataset.provider!;
     providers[name] = {};
-    row.querySelectorAll<HTMLInputElement>('input[data-field]').forEach((inp) => {
-      providers[name][inp.dataset.field!] = inp.value.trim();
-    });
+    row
+      .querySelectorAll<HTMLInputElement | HTMLSelectElement>('input[data-field], select[data-field]')
+      .forEach((inp) => {
+        providers[name][inp.dataset.field!] = inp.value.trim();
+      });
   });
   return providers;
 }
@@ -372,9 +427,8 @@ function toProviderConfig(fields: Record<string, string>): ProviderConfig {
     base_url: fields.base_url || '',
     api_key_env: fields.api_key_env || '',
   };
-  for (const k of ['chunking_model', 'peeling_model', 'skill_engine_model'] as const) {
-    const v = fields[k];
-    if (v) cfg[k] = v;
+  for (const k of [...MODEL_KEYS, ...REASONING_KEYS]) {
+    if (k in fields) cfg[k] = fields[k];
   }
   return cfg;
 }
@@ -385,28 +439,30 @@ function toProviderConfigMap(all: Record<string, Record<string, string>>): Recor
   return out;
 }
 
-export async function saveConfigUI(): Promise<boolean> {
-  hideSaveError();
-
-  const providers = gatherProvidersFromUI();
-
-  const routers = {
+function gatherRouters(): RoutersConfig {
+  return {
     chunking: (document.getElementById('chunk-provider') as HTMLSelectElement).value,
     peeling: (document.getElementById('peel-provider') as HTMLSelectElement).value,
     skillEngine: (document.getElementById('skill-provider') as HTMLSelectElement).value,
   };
+}
 
-  const pdf = {
+function gatherPdf(base: PdfConfig): PdfConfig {
+  return {
+    ...base,
     request_interval: parseFloat(val('request-interval')) || 0.3,
     page_limit: parseInt(val('pdf-page-limit'), 10) || 200,
     chunk_merge_threshold: parseInt(val('pdf-merge-threshold'), 10) || 5000,
     chunk_min_threshold: parseInt(val('pdf-min-threshold'), 10) || 1000,
   };
+}
 
-  const mineru = {
+function gatherMineru(base: MineruConfig): MineruConfig {
+  return {
     api_mode: mineruMode,
     language: mineruMode === 'local' ? val('mu-language') : val('mu-language-remote'),
     local: {
+      ...base.local,
       base_url: val('mu-local-url'),
       backend: val('mu-local-backend'),
       parse_method: val('mu-local-parse'),
@@ -414,20 +470,29 @@ export async function saveConfigUI(): Promise<boolean> {
       table_enable: checked('mu-local-table'),
     },
     remote: {
+      ...base.remote,
       model_version: val('mu-remote-model'),
       page_ranges: val('mu-remote-pages'),
       is_ocr: checked('mu-remote-ocr'),
       enable_formula: checked('mu-remote-formula'),
       enable_table: checked('mu-remote-table'),
-      extra_formats: [],
     },
   };
+}
+
+export async function saveConfigUI(): Promise<boolean> {
+  hideSaveError();
 
   const cfg = sdk().getConfig();
-  cfg.providers = toProviderConfigMap(providers);
+  const providers = toProviderConfigMap(gatherProvidersFromUI());
+  const routers = gatherRouters();
+  const pdf = gatherPdf(cfg.pdf);
+  const mineru = gatherMineru(cfg.mineru);
+
+  cfg.providers = providers;
   cfg.routers = routers;
-  Object.assign(cfg.pdf, pdf);
-  Object.assign(cfg.mineru, mineru);
+  cfg.pdf = pdf;
+  cfg.mineru = mineru;
 
   const issues = validateConfig(cfg);
   if (issues.length > 0) {
@@ -435,49 +500,66 @@ export async function saveConfigUI(): Promise<boolean> {
     return false;
   }
 
+  // Browser-local persistence stays available when the proxy is offline;
+  // server persistence is attempted on every save.
   sdk().configure(cfg);
-  showToast('配置已保存（浏览器本地）');
+  try {
+    const deletes = [...pendingDeletes].filter((name) => !(name in providers));
+    await saveServerConfig(providers, routers, pdf, mineru, deletes);
+    deletes.forEach((name) => pendingDeletes.delete(name));
+    showToast('配置已保存（浏览器 + 服务端）');
+  } catch (e) {
+    const info = errInfoOf(e);
+    showToast(`已保存到浏览器；服务端写入失败：${info.message}`, 'error');
+  }
   await loadConfigUI();
   return true;
+}
+
+function routersFromServer(routers: Record<string, string>): RoutersConfig {
+  return {
+    chunking: routers?.chunking || routers?.chunking_provider || '',
+    peeling: routers?.peeling || routers?.peeling_provider || '',
+    skillEngine: routers?.skillEngine || routers?.skill_engine_provider || '',
+  };
+}
+
+/** Fresh browser/origin: adopt the server config instead of showing defaults. */
+export async function hydrateConfigFromServer(): Promise<void> {
+  if (Object.keys(sdk().getConfig().providers).length > 0) return;
+  try {
+    const data = await getServerConfig();
+    if (!data.ok || !data.providers || Object.keys(data.providers).length === 0) return;
+    sdk().configure({
+      providers: data.providers,
+      routers: routersFromServer(data.routers),
+      pdf: data.pdf,
+      mineru: data.mineru,
+    });
+  } catch {
+    // Proxy offline: keep local defaults; the import button retries later.
+  }
 }
 
 async function importFromServer(): Promise<void> {
   hideSaveError();
   try {
-    const data = await getProviders();
+    const data = await getServerConfig();
     if (!data.ok || !data.providers || Object.keys(data.providers).length === 0) {
       showSaveError({
         errInfo: { code: 'NO_PROVIDER', message: '服务端 settings.yaml 中没有 Provider', advice: '请先在服务端配置 llm.providers' },
       });
       return;
     }
-    const routers = {
-      chunking: data.routers?.chunking_provider || data.routers?.chunking || '',
-      peeling: data.routers?.peeling_provider || data.routers?.peeling || '',
-      skillEngine: data.routers?.skill_engine_provider || data.routers?.skillEngine || '',
-    };
     sdk().configure({
-      providers: toProviderConfigMap(data.providers),
-      routers,
+      providers: data.providers,
+      routers: routersFromServer(data.routers),
+      pdf: data.pdf,
+      mineru: data.mineru,
     });
+    pendingDeletes.clear();
     await loadConfigUI();
-    showToast(`已导入 ${Object.keys(data.providers).length} 个 Provider`);
-  } catch (e) {
-    showSaveError(e);
-  }
-}
-
-async function syncToServer(): Promise<void> {
-  hideSaveError();
-  const providers = gatherProvidersFromUI();
-  const routers = {
-    chunking: (document.getElementById('chunk-provider') as HTMLSelectElement).value,
-    peeling: (document.getElementById('peel-provider') as HTMLSelectElement).value,
-    skillEngine: (document.getElementById('skill-provider') as HTMLSelectElement).value,
-  };
-  try {
-    await syncProviders(providers, routers);
-    showToast('已同步到服务端 settings.yaml');
+    showToast(`已从服务端导入 ${Object.keys(data.providers).length} 个 Provider 与全部参数`);
   } catch (e) {
     showSaveError(e);
   }
@@ -496,7 +578,6 @@ export function setupConfigTab(sdkInstance: Pdf2Skill): void {
   $('btn-save-new-provider').addEventListener('click', () => void saveNewProvider());
   $('btn-save-config').addEventListener('click', () => void saveConfigUI());
   $('btn-import-providers').addEventListener('click', () => void importFromServer());
-  $('btn-sync-providers').addEventListener('click', () => void syncToServer());
   $('mode-local').addEventListener('click', () => setMinerUMode('local'));
   $('mode-remote').addEventListener('click', () => setMinerUMode('remote'));
   $('btn-set-mu-key').addEventListener('click', () => {

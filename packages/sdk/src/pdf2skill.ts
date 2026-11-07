@@ -1,11 +1,15 @@
 import type {
   JobMeta,
+  JobSummary,
   OutputFile,
   OutputTreeNode,
   Pdf2SkillConfig,
+  ResettableStage,
   RunInput,
   RunOptions,
   RunResult,
+  SkillZipResult,
+  StageName,
 } from './types';
 import { Pdf2SkillError } from './errors';
 import { Emitter } from './events';
@@ -14,7 +18,7 @@ import { SKILL_NAME_RULES, validateSkillName } from './naming';
 import type { LlmTransport } from './stages/llmTransport';
 import type { LlmStage } from './llm/llmClient';
 import { runPipeline } from './pipeline';
-import { exportJobZip } from './export/zip';
+import { exportJobZip, exportSkillZipBundle } from './export/zip';
 import {
   ensureDir,
   fileExists,
@@ -27,8 +31,37 @@ import {
   writeText,
 } from './storage/opfs';
 import { CheckpointManager } from './storage/checkpoint';
+import { importJobBundle } from './storage/importJob';
 
 const JOBS_DIR = 'jobs';
+const INTERNAL_JOB_DIRS = new Set(['peeling_cache']);
+
+const STAGE_SEQUENCE: StageName[] = [
+  'pdf_conversion',
+  'llm_chunking',
+  'tree_merging',
+  'skill_generation',
+];
+
+/**
+ * Keep job.json aligned with an explicit stage reset. listJobs derives the
+ * three pipeline stages from the checkpoint, but Stage 4 has no top-level
+ * checkpoint entry, so its flag must be dropped here or it would survive a
+ * Stage 2/3 rebuild and describe a SKILL.md that is about to be replaced.
+ */
+function truncateCompletedStages(
+  meta: JobMeta,
+  fromStage?: ResettableStage,
+  restart = false,
+): void {
+  if (restart) {
+    meta.completedStages = [];
+    return;
+  }
+  if (!fromStage) return;
+  const keep = new Set<StageName>(STAGE_SEQUENCE.slice(0, STAGE_SEQUENCE.indexOf(fromStage)));
+  meta.completedStages = meta.completedStages.filter((s) => keep.has(s));
+}
 
 export interface Pdf2SkillOptions {
   /** Initial config (deep-merged onto defaults; falls back to localStorage). */
@@ -37,6 +70,12 @@ export interface Pdf2SkillOptions {
   storageRoot?: FileSystemDirectoryHandle;
   /** LLM transport factory override (tests inject a mock). */
   createLlm?: (stage: LlmStage) => LlmTransport;
+}
+
+export interface ImportJobOptions {
+  /** Display name for the job list (defaults to the job id). */
+  inputName?: string;
+  onProgress?: (done: number, total: number) => void;
 }
 
 /**
@@ -138,22 +177,69 @@ export class Pdf2Skill {
 
   private async readJobMeta(jobRoot: FileSystemDirectoryHandle): Promise<JobMeta> {
     const raw = await readText(jobRoot, 'job.json');
-    return JSON.parse(raw) as JobMeta;
+    const data = JSON.parse(raw) as Partial<JobMeta> | null;
+    if (typeof data !== 'object' || data === null) {
+      throw new Error('job.json is not an object');
+    }
+    const stages = Array.isArray(data.completedStages)
+      ? data.completedStages.filter((s): s is StageName => STAGE_SEQUENCE.includes(s as StageName))
+      : [];
+    return {
+      jobId: typeof data.jobId === 'string' && data.jobId ? data.jobId : jobRoot.name,
+      inputName:
+        typeof data.inputName === 'string' && data.inputName ? data.inputName : jobRoot.name,
+      completedStages: stages,
+      updatedAt: typeof data.updatedAt === 'number' ? data.updatedAt : 0,
+    };
   }
 
-  async listJobs(): Promise<JobMeta[]> {
+  private async summarizeJob(
+    dir: FileSystemDirectoryHandle,
+    meta: JobMeta,
+  ): Promise<JobSummary> {
+    const checkpoint = new CheckpointManager(dir);
+    await checkpoint.load();
+
+    const stage1Data =
+      (checkpoint.getStageData('pdf_conversion') as { md_file?: string } | undefined) ?? {};
+    const mdName = (stage1Data.md_file ?? '').split(/[\\/]/).filter(Boolean).pop() ?? '';
+    const mdExists = !!mdName && (await fileExists(dir, mdName));
+    const completed = new Set<StageName>();
+    if (checkpoint.isStageCompleted('pdf_conversion')) completed.add('pdf_conversion');
+    if (checkpoint.isStageCompleted('llm_chunking')) completed.add('llm_chunking');
+    if (checkpoint.isStageCompleted('tree_merging')) completed.add('tree_merging');
+
+    const skillDir = await getDir(dir, 'generated_skills');
+    if (
+      skillDir &&
+      meta.completedStages.includes('skill_generation') &&
+      (await fileExists(skillDir, 'SKILL.md'))
+    ) {
+      completed.add('skill_generation');
+    }
+
+    return {
+      ...meta,
+      completedStages: STAGE_SEQUENCE.filter((s) => completed.has(s)),
+      resumable: checkpoint.isStageCompleted('pdf_conversion') && mdExists,
+    };
+  }
+
+  async listJobs(): Promise<JobSummary[]> {
     const jobs = await this.jobsDir();
-    const metas: JobMeta[] = [];
+    const metas: JobSummary[] = [];
     for (const entry of await listDir(jobs)) {
       if (entry.kind !== 'directory') continue;
       const dir = await jobs.getDirectoryHandle(entry.name);
       if (!(await fileExists(dir, 'job.json'))) continue;
+      let meta: JobMeta;
       try {
-        metas.push(await this.readJobMeta(dir));
+        meta = await this.readJobMeta(dir);
       } catch {
         // Corrupt job.json: still list it with a minimal meta.
-        metas.push({ jobId: entry.name, inputName: entry.name, completedStages: [], updatedAt: 0 });
+        meta = { jobId: entry.name, inputName: entry.name, completedStages: [], updatedAt: 0 };
       }
+      metas.push(await this.summarizeJob(dir, meta));
     }
     metas.sort((a, b) => b.updatedAt - a.updatedAt);
     return metas;
@@ -165,6 +251,33 @@ export class Pdf2Skill {
       throw new Pdf2SkillError('JOB_NOT_FOUND', `任务 '${jobId}' 不存在`, '');
     }
     await removeEntry(jobs, jobId);
+  }
+
+  /**
+   * Import a server-side job bundle (``frontend/job_bridge.py``) into OPFS so
+   * a CLI job can be resumed from the same checkpoint in the browser.
+   */
+  async importJob(
+    jobId: string,
+    zipBytes: Uint8Array,
+    options: ImportJobOptions = {},
+  ): Promise<JobSummary> {
+    if (this.abortController) {
+      throw new Pdf2SkillError('ALREADY_RUNNING', '已有任务正在运行，无法导入', '请先停止当前任务');
+    }
+    const jobs = await this.jobsDir();
+    const meta = await importJobBundle({
+      jobsDir: jobs,
+      jobId,
+      zipBytes,
+      inputName: options.inputName,
+      onProgress: options.onProgress,
+    });
+    const dir = await getDir(jobs, jobId);
+    if (!dir) {
+      throw new Pdf2SkillError('JOB_NOT_FOUND', `导入后未找到任务 '${jobId}'`, '');
+    }
+    return this.summarizeJob(dir, meta);
   }
 
   // ── run / abort / resume ────────────────────────────────────────────
@@ -213,6 +326,7 @@ export class Pdf2Skill {
       updatedAt: 0,
     };
     meta.inputName = input.name;
+    truncateCompletedStages(meta, options.fromStage, !!options.restart);
     meta.updatedAt = Date.now();
     await this.writeJobMeta(jobRoot, meta);
 
@@ -226,18 +340,29 @@ export class Pdf2Skill {
   }
 
   /** Continue a previously created job from its checkpoint. */
-  async resume(jobId: string, options: Omit<RunOptions, 'restart'> = {}): Promise<RunResult> {
+  async resume(
+    jobId: string,
+    options: Omit<RunOptions, 'restart' | 'outputName'> = {},
+  ): Promise<RunResult> {
     if (this.abortController) {
       throw new Pdf2SkillError('ALREADY_RUNNING', '已有任务正在运行', '请先等待完成或调用 abort()');
     }
     const jobRoot = await this.jobRoot(jobId);
+    // resume() has no source bytes; re-running Stage 1 would either fail
+    // validation or silently reuse the old markdown. Require a fresh run().
+    if (options.fromStage === 'pdf_conversion') {
+      throw new Pdf2SkillError(
+        'JOB_MISSING_INPUT',
+        `任务 '${jobId}' 缺少原始输入，无法重跑 Stage 1`,
+        '请重新上传原始 PDF / Markdown 文件后运行',
+      );
+    }
     const meta = await this.readJobMeta(jobRoot).catch(() => ({
       jobId,
       inputName: jobId,
       completedStages: [],
       updatedAt: 0,
     }) as JobMeta);
-
     // Stage 1 needs input bytes unless pdf_conversion is already checkpointed
     // with its markdown file still on disk.
     const checkpoint = new CheckpointManager(jobRoot);
@@ -256,6 +381,10 @@ export class Pdf2Skill {
       );
     }
 
+    truncateCompletedStages(meta, options.fromStage);
+    meta.updatedAt = Date.now();
+    await this.writeJobMeta(jobRoot, meta);
+
     const controller = new AbortController();
     this.abortController = controller;
     if (options.signal) {
@@ -263,7 +392,13 @@ export class Pdf2Skill {
     }
     this.runningJobId = jobId;
     try {
-      const result = await this.execute(jobRoot, input, { ...options, fromStage: options.fromStage }, controller.signal, meta);
+      const result = await this.execute(
+        jobRoot,
+        input,
+        { fromStage: options.fromStage },
+        controller.signal,
+        meta,
+      );
       return { jobId, ...result };
     } finally {
       this.abortController = null;
@@ -331,6 +466,7 @@ export class Pdf2Skill {
   private async buildTree(dir: FileSystemDirectoryHandle): Promise<OutputTreeNode[]> {
     const nodes: OutputTreeNode[] = [];
     for (const entry of await listDir(dir)) {
+      if (INTERNAL_JOB_DIRS.has(entry.name)) continue;
       if (entry.kind === 'directory') {
         const children = await this.buildTree(await dir.getDirectoryHandle(entry.name));
         nodes.push({
@@ -387,6 +523,15 @@ export class Pdf2Skill {
   async exportZip(jobId: string): Promise<Blob> {
     const jobRoot = await this.jobRoot(jobId);
     return exportJobZip(jobRoot);
+  }
+
+  /**
+   * Package `generated_skills/` as an installable skill zip: the folder is
+   * renamed to the SKILL.md `name` and nested under it in the archive.
+   */
+  async exportSkillZip(jobId: string): Promise<SkillZipResult> {
+    const jobRoot = await this.jobRoot(jobId);
+    return exportSkillZipBundle(jobRoot, jobId);
   }
 
   /** Best-effort storage usage estimate (null when unsupported). */
