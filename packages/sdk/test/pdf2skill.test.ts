@@ -4,7 +4,7 @@ import { Pdf2SkillError } from '../src/errors';
 import type { LlmTransport } from '../src/stages/llmTransport';
 import { mockOpfsRoot } from './helpers/mockOpfs';
 import { CheckpointManager } from '../src/storage/checkpoint';
-import { ensureDir, readText } from '../src/storage/opfs';
+import { ensureDir, readText, removeEntry, writeText } from '../src/storage/opfs';
 
 const DOC = `# Book Title
 
@@ -74,7 +74,7 @@ const file = () => new File([DOC], 'facade book.md', { type: 'text/markdown' });
 
 describe('Pdf2Skill facade', () => {
   it('run → done event → jobs/output APIs', async () => {
-    const { sdk } = makeSdk();
+    const { root, sdk } = makeSdk();
     const doneResults: unknown[] = [];
     const stageEvents: string[] = [];
     sdk.on('done', (e) => doneResults.push(e));
@@ -94,6 +94,10 @@ describe('Pdf2Skill facade', () => {
     expect(jobs[0].inputName).toBe('facade book.md');
     expect(jobs[0].completedStages).toContain('skill_generation');
 
+    // The peeling cache is internal bookkeeping, not an output.
+    const jobRoot = await ensureDir(await ensureDir(root, 'jobs'), 'facade_book');
+    await writeText(await ensureDir(jobRoot, 'peeling_cache'), 'entry.json', '{}');
+
     // listOutputTree
     const tree = await sdk.listOutputTree('facade_book');
     expect(tree.type).toBe('dir');
@@ -102,6 +106,7 @@ describe('Pdf2Skill facade', () => {
     expect(names).toContain('full_chunks');
     expect(names).toContain('full_chunks_original');
     expect(names).toContain('.checkpoint.json');
+    expect(names).not.toContain('peeling_cache');
 
     // readOutputFile
     const skill = await sdk.readOutputFile('facade_book', 'generated_skills/SKILL.md');
@@ -144,9 +149,11 @@ describe('Pdf2Skill facade', () => {
     await expect(sdk.listOutputTree('facade_book')).rejects.toMatchObject({ code: 'JOB_NOT_FOUND' });
   });
 
-  it('exportZip mirrors the Python outputs layout (no input file / job meta)', async () => {
-    const { sdk } = makeSdk();
+  it('exportZip keeps the markdown input and omits job meta', async () => {
+    const { root, sdk } = makeSdk();
     await sdk.run({ kind: 'markdown', file: file(), name: 'facade book.md' });
+    const jobRoot = await ensureDir(await ensureDir(root, 'jobs'), 'facade_book');
+    await writeText(await ensureDir(jobRoot, 'peeling_cache'), 'entry.json', '{}');
 
     const blob = await sdk.exportZip('facade_book');
     expect(blob.size).toBeGreaterThan(0);
@@ -155,15 +162,81 @@ describe('Pdf2Skill facade', () => {
     const zip = await JSZip.loadAsync(blob);
     const paths = Object.keys(zip.files).sort();
     expect(paths).toContain('.checkpoint.json');
+    expect(paths).toContain('input.md');
     expect(paths).toContain('generated_skills/SKILL.md');
     expect(paths).toContain('generated_skills/references/chunk_0001.md');
     expect(paths).toContain('full_chunks/tree.json');
     expect(paths).toContain('full_chunks_original/chunks_index.json');
     expect(paths).not.toContain('job.json');
-    expect(paths).not.toContain('input.md');
+    expect(paths.some((p) => p.startsWith('peeling_cache/'))).toBe(false);
 
     const skillMd = await zip.files['generated_skills/SKILL.md'].async('string');
     expect(skillMd).toContain('name: facade-test-book');
+  });
+
+  it('an exported markdown job can be imported again from its zip', async () => {
+    const { sdk } = makeSdk();
+    await sdk.run({ kind: 'markdown', file: file(), name: 'facade book.md' });
+
+    const blob = await sdk.exportZip('facade_book');
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    const summary = await sdk.importJob('facade_copy', bytes);
+
+    expect(summary.resumable).toBe(true);
+    expect(summary.completedStages).toContain('pdf_conversion');
+  });
+
+  it('exportSkillZip puts SKILL.md and references at the archive root', async () => {
+    const { sdk } = makeSdk();
+    await sdk.run({ kind: 'markdown', file: file(), name: 'facade book.md' });
+
+    const { blob, skillName } = await sdk.exportSkillZip('facade_book');
+
+    expect(skillName).toBe('facade-test-book');
+    const JSZip = (await import('jszip')).default;
+    const zip = await JSZip.loadAsync(blob);
+    const paths = Object.keys(zip.files).sort();
+    expect(paths).toContain('SKILL.md');
+    expect(paths).toContain('references/chunk_0001.md');
+    expect(paths.some((p) => p.startsWith('facade-test-book/'))).toBe(false);
+    expect(paths).not.toContain('.checkpoint.json');
+  });
+
+  it('exportSkillZip falls back to the job id when SKILL.md has no name', async () => {
+    const { root, sdk } = makeSdk();
+    await sdk.run({ kind: 'markdown', file: file(), name: 'facade book.md' });
+    const jobRoot = await ensureDir(await ensureDir(root, 'jobs'), 'facade_book');
+    const skillDir = await ensureDir(jobRoot, 'generated_skills');
+    await writeText(skillDir, 'SKILL.md', '---\ndescription: no name here\n---\n');
+
+    const { skillName } = await sdk.exportSkillZip('facade_book');
+
+    expect(skillName).toBe('facade-book');
+  });
+
+  it('exportSkillZip sanitizes path separators in the skill name', async () => {
+    const { root, sdk } = makeSdk();
+    await sdk.run({ kind: 'markdown', file: file(), name: 'facade book.md' });
+    const jobRoot = await ensureDir(await ensureDir(root, 'jobs'), 'facade_book');
+    const skillDir = await ensureDir(jobRoot, 'generated_skills');
+    await writeText(skillDir, 'SKILL.md', '---\nname: "../evil/skill"\n---\n');
+
+    const { skillName } = await sdk.exportSkillZip('facade_book');
+
+    expect(skillName).not.toContain('/');
+    expect(skillName).not.toContain('\\');
+    expect(skillName.startsWith('.')).toBe(false);
+  });
+
+  it('exportSkillZip requires a generated_skills/SKILL.md', async () => {
+    const { root, sdk } = makeSdk();
+    await sdk.run({ kind: 'markdown', file: file(), name: 'facade book.md' });
+    const jobRoot = await ensureDir(await ensureDir(root, 'jobs'), 'facade_book');
+    await removeEntry(jobRoot, 'generated_skills');
+
+    await expect(sdk.exportSkillZip('facade_book')).rejects.toMatchObject({
+      code: 'SKILL_NOT_FOUND',
+    });
   });
 
   it('abort mid-Stage-4 keeps summaries; resume completes without redoing them', async () => {
@@ -180,6 +253,12 @@ describe('Pdf2Skill facade', () => {
 
     // Fine-grained checkpoint: chunk 1 summarised, chunk 2/3 missing.
     const jobs = await sdk.listJobs();
+    expect(jobs[0].resumable).toBe(true);
+    expect(jobs[0].completedStages).toEqual([
+      'pdf_conversion',
+      'llm_chunking',
+      'tree_merging',
+    ]);
     const jobRoot = await ensureDir(await ensureDir(root, 'jobs'), jobs[0].jobId);
     const skillCp = new CheckpointManager(await ensureDir(jobRoot, 'generated_skills'));
     await skillCp.load();
@@ -192,6 +271,9 @@ describe('Pdf2Skill facade', () => {
     const resumed = await sdk2.resume(jobs[0].jobId);
     expect(resumed.skillName).toBe('facade-test-book');
     expect(resumed.referenceCount).toBe(3);
+    const afterResume = await sdk2.listJobs();
+    expect(afterResume[0].completedStages).toContain('skill_generation');
+    expect(afterResume[0].resumable).toBe(true);
 
     const skillMd = await readText(await ensureDir(jobRoot, 'generated_skills'), 'SKILL.md');
     expect(skillMd).toContain('(references/chunk_0001.md): tag-1');
@@ -202,6 +284,28 @@ describe('Pdf2Skill facade', () => {
   it('resume rejects when Stage 1 is not checkpointed', async () => {
     const { sdk } = makeSdk();
     await expect(sdk.resume('missing-job')).rejects.toMatchObject({ code: 'JOB_NOT_FOUND' });
+  });
+
+  it('resume cannot re-run Stage 1 without re-uploading the source', async () => {
+    const { sdk } = makeSdk();
+    await sdk.run({ kind: 'markdown', file: file(), name: 'resume book.md' });
+    await expect(
+      sdk.resume('resume_book', { fromStage: 'pdf_conversion' }),
+    ).rejects.toMatchObject({ code: 'JOB_MISSING_INPUT' });
+  });
+
+  it('listJobs marks a job unresumable when its Stage 1 markdown is gone', async () => {
+    const { root, sdk } = makeSdk();
+    await sdk.run({ kind: 'markdown', file: file(), name: 'facade book.md' });
+    const jobRoot = await ensureDir(await ensureDir(root, 'jobs'), 'facade_book');
+    await removeEntry(jobRoot, 'input.md');
+
+    const [job] = await sdk.listJobs();
+    expect(job.resumable).toBe(false);
+    expect(job.completedStages).toContain('pdf_conversion');
+    await expect(sdk.resume('facade_book')).rejects.toMatchObject({
+      code: 'JOB_MISSING_INPUT',
+    });
   });
 
   it('run with outputName uses it as jobId and SKILL.md name (no LLM naming)', async () => {

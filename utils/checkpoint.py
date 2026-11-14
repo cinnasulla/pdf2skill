@@ -31,15 +31,28 @@ class CheckpointManager:
             try:
                 with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                if data.get("version") != CHECKPOINT_VERSION:
+                if (
+                    not isinstance(data, dict)
+                    or data.get("version") != CHECKPOINT_VERSION
+                    or not isinstance(data.get("completed_stages"), list)
+                    or not isinstance(data.get("data"), dict)
+                ):
                     logger.warning(
-                        f"Checkpoint version mismatch (expected {CHECKPOINT_VERSION}, "
-                        f"got {data.get('version')}). Resetting checkpoint."
+                        f"Checkpoint invalid or version mismatch (expected {CHECKPOINT_VERSION}). "
+                        "Resetting checkpoint."
                     )
                     return {"version": CHECKPOINT_VERSION, "completed_stages": [], "data": {}}
                 return data
-            except (json.JSONDecodeError, Exception) as e:
-                logger.warning(f"Failed to load checkpoint: {e}. Resetting.")
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                logger.warning(f"Failed to parse checkpoint: {e}. Resetting.")
+            except OSError as e:
+                # AV scanners / Windows file locks are transient; silently
+                # resetting would make the next save() overwrite a valid
+                # checkpoint and lose completed stages.
+                logger.error(f"Failed to read checkpoint due to an I/O error: {e}")
+                raise RuntimeError(
+                    f"无法读取 checkpoint（{self.checkpoint_file}）：{e}"
+                ) from e
         return {"version": CHECKPOINT_VERSION, "completed_stages": [], "data": {}}
 
     def save(self):

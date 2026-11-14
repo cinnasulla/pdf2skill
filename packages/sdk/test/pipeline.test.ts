@@ -5,7 +5,7 @@ import { defaultConfig, mergeConfig } from '../src/config';
 import type { LlmTransport } from '../src/stages/llmTransport';
 import { mockOpfsRoot } from './helpers/mockOpfs';
 import { CheckpointManager } from '../src/storage/checkpoint';
-import { ensureDir, fileExists, readText, getDir } from '../src/storage/opfs';
+import { dirExists, ensureDir, fileExists, readText, getDir, listDir, writeText } from '../src/storage/opfs';
 
 const DOC = `# Book Title
 
@@ -61,13 +61,61 @@ const mdInput = (name = 'test book.md') => ({
   input: { kind: 'markdown' as const, bytes: new TextEncoder().encode(DOC), filename: name },
 });
 
+const chapterBlock = (name: string, word: string): string =>
+  `## ${name}\n\n${(word + ' ').repeat(1200)}\n\n`;
+
+const BIG_DOC =
+  '# Book Title\n\n' +
+  chapterBlock('Chapter 1', 'alpha') +
+  chapterBlock('Chapter 2', 'beta') +
+  chapterBlock('Chapter 3', 'gamma');
+
+const bigInput = (name = 'big book.md') => ({
+  jobRoot: mockOpfsRoot(),
+  input: {
+    kind: 'markdown' as const,
+    bytes: new TextEncoder().encode(BIG_DOC),
+    filename: name,
+  },
+});
+
+function makeCacheLlm(calls: { peel: number }): LlmTransport {
+  let tag = 0;
+  return {
+    async chat(prompt: string): Promise<string> {
+      if (prompt.includes('document structure analyzer')) {
+        return JSON.stringify({
+          chapter_splits: [3, 7, 11],
+          toc_range: [1, 2],
+          atomic_ranges: {},
+        });
+      }
+      if (prompt.includes('document chunking assistant')) {
+        calls.peel++;
+        return JSON.stringify({ anchors: [], is_atomic: false });
+      }
+      if (prompt.includes('curriculum designer')) {
+        return 'A cache test overview.\n[METADATA_DESC: Cache test]';
+      }
+      if (prompt.includes('kebab-case')) {
+        return 'cache-book';
+      }
+      tag++;
+      return `tag-${tag}`;
+    },
+    parseJson(text: string): Record<string, unknown> {
+      return JSON.parse(text);
+    },
+  };
+}
+
 describe('runPipeline (markdown input)', () => {
   it('runs all four stages and produces the expected layout', async () => {
     const config = mergeConfig(defaultConfig(), {});
     const { jobRoot, input } = mdInput();
     const llm = makeLlm();
     const events: { stage: string; status: string }[] = [];
-    const logs: string[] = [];
+    const logs: { message: string; kind?: string }[] = [];
 
     const result: PipelineResult = await runPipeline({
       jobRoot,
@@ -80,7 +128,8 @@ describe('runPipeline (markdown input)', () => {
             const p = payload as { stage: string; status: string };
             events.push({ stage: p.stage, status: p.status });
           } else if (event === 'log') {
-            logs.push((payload as { message: string }).message);
+            const p = payload as { message: string; kind?: string };
+            logs.push({ message: p.message, kind: p.kind });
           }
         },
       } as never,
@@ -116,6 +165,11 @@ describe('runPipeline (markdown input)', () => {
       expect(events.filter((e) => e.stage === s && e.status === 'active').length).toBeGreaterThan(0);
       expect(events.filter((e) => e.stage === s && e.status === 'done').length).toBe(1);
     }
+
+    // Logs carry UI hints: stage headers are dividers, stage internals are
+    // verbose detail hidden by default in the workbench.
+    expect(logs.find((l) => l.message === 'Stage 3 · Peeling')?.kind).toBe('stage');
+    expect(logs.some((l) => l.kind === 'detail')).toBe(true);
   });
 
   it('Stage 2 fallback does not write a checkpoint', async () => {
@@ -196,6 +250,82 @@ describe('runPipeline (markdown input)', () => {
     expect(llm.calls[1]).toContain('curriculum designer');
   });
 
+  it('Stage 2 retry after a fallback rebuilds the stale tree checkpoint', async () => {
+    const config = mergeConfig(defaultConfig(), {});
+    const { jobRoot, input } = mdInput();
+    const brokenChunker: LlmTransport = {
+      async chat() {
+        return 'garbage response';
+      },
+      parseJson() {
+        throw new Error('no json');
+      },
+    };
+    const peelingLlm = makeLlm();
+
+    // Run 1: chunking falls back to one uniform chunk; Stage 3 succeeds on
+    // that chunk and checkpoints its tree, then Stage 4 completes.
+    await runPipeline({
+      jobRoot,
+      config,
+      input,
+      createLlm: (stage) => (stage === 'chunking' ? brokenChunker : peelingLlm),
+    });
+    const afterFallback = new CheckpointManager(jobRoot);
+    await afterFallback.load();
+    expect(afterFallback.isStageCompleted('llm_chunking')).toBe(false);
+    expect(afterFallback.isStageCompleted('tree_merging')).toBe(true);
+
+    // Run 2: chunking succeeds. The fallback-era tree checkpoint must not
+    // survive, or Stage 3 would be skipped and the new chunks ignored.
+    const llm2 = makeLlm();
+    await runPipeline({
+      jobRoot,
+      config,
+      input: { kind: 'markdown', filename: 'test book.md' },
+      createLlm: () => llm2,
+    });
+
+    const cp = new CheckpointManager(jobRoot);
+    await cp.load();
+    expect(cp.isStageCompleted('llm_chunking')).toBe(true);
+    const index = JSON.parse(
+      await readText(await ensureDir(jobRoot, 'full_chunks'), 'chunks_index.json'),
+    ) as unknown[];
+    expect(index.length).toBe(3);
+    // Stage 4's id-keyed summaries were also stale, so tagging re-runs.
+    expect(
+      llm2.calls.some(
+        (c) => c.includes('technical indexer') || c.includes('curriculum designer'),
+      ),
+    ).toBe(true);
+  });
+
+  it('fromStage pdf_conversion clears cached Stage 1 artifacts', async () => {
+    const config = mergeConfig(defaultConfig(), {});
+    const { jobRoot, input } = mdInput();
+    await runPipeline({ jobRoot, config, input, createLlm: () => makeLlm() });
+
+    // Simulate a previous PDF conversion's cached outputs.
+    await writeText(jobRoot, 'full.md', '# stale conversion');
+    await ensureDir(jobRoot, 'splits');
+    await writeText(jobRoot, 'book_mineru_output.zip', 'PK');
+    await writeText(jobRoot, 'remote_mineru_output.zip', 'PK');
+
+    await runPipeline({
+      jobRoot,
+      config,
+      input: { kind: 'markdown', filename: 'test book.md' },
+      fromStage: 'pdf_conversion',
+      createLlm: () => makeLlm(),
+    });
+
+    expect(await fileExists(jobRoot, 'full.md')).toBe(false);
+    expect(await dirExists(jobRoot, 'splits')).toBe(false);
+    expect(await fileExists(jobRoot, 'book_mineru_output.zip')).toBe(false);
+    expect(await fileExists(jobRoot, 'remote_mineru_output.zip')).toBe(false);
+  });
+
   it('fromStage resets that stage and all later stages', async () => {
     const config = mergeConfig(defaultConfig(), {});
     const { jobRoot, input } = mdInput();
@@ -213,5 +343,59 @@ describe('runPipeline (markdown input)', () => {
     // pdf_conversion kept, later stages re-written on completion
     expect(cp.isStageCompleted('pdf_conversion')).toBe(true);
     expect(cp.isStageCompleted('llm_chunking')).toBe(true);
+  });
+
+  it('fromStage llm_chunking reuses peeled subtrees from the cache', async () => {
+    const config = mergeConfig(defaultConfig(), { pdf: { chunk_max_tokens: 1000 } });
+    const { jobRoot, input } = bigInput();
+    const first = { peel: 0 };
+    await runPipeline({
+      jobRoot,
+      config,
+      input,
+      createLlm: () => makeCacheLlm(first),
+    });
+    expect(first.peel).toBe(3);
+    const cacheDir = await getDir(jobRoot, 'peeling_cache');
+    expect(cacheDir).toBeTruthy();
+    expect((await listDir(cacheDir!)).filter((e) => e.kind === 'file')).toHaveLength(3);
+
+    const second = { peel: 0 };
+    await runPipeline({
+      jobRoot,
+      config,
+      input: { kind: 'markdown', filename: 'big book.md' },
+      fromStage: 'llm_chunking',
+      createLlm: () => makeCacheLlm(second),
+    });
+    expect(second.peel).toBe(0);
+    expect(
+      (await listDir((await getDir(jobRoot, 'peeling_cache'))!)).filter(
+        (e) => e.kind === 'file',
+      ),
+    ).toHaveLength(3);
+  });
+
+  it('restart clears the peeling cache', async () => {
+    const config = mergeConfig(defaultConfig(), { pdf: { chunk_max_tokens: 1000 } });
+    const { jobRoot, input } = bigInput();
+    const first = { peel: 0 };
+    await runPipeline({
+      jobRoot,
+      config,
+      input,
+      createLlm: () => makeCacheLlm(first),
+    });
+    expect(first.peel).toBe(3);
+
+    const second = { peel: 0 };
+    await runPipeline({
+      jobRoot,
+      config,
+      input: { ...input, bytes: new TextEncoder().encode(BIG_DOC) },
+      restart: true,
+      createLlm: () => makeCacheLlm(second),
+    });
+    expect(second.peel).toBe(3);
   });
 });
