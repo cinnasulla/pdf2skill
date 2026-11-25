@@ -5,6 +5,7 @@ These mirror the SDK-side cases in packages/sdk/test/treeMerger.test.ts
 in parity. LLMClient is faked; no network access.
 """
 import json
+import logging
 
 import pytest
 
@@ -83,6 +84,58 @@ class TestFindAnchorPosition:
     def test_fuzzy_beyond_threshold_returns_minus_one(self):
         assert (
             self.merger.find_anchor_position("The beginning here", "xxxxxxxxxg herx") == -1
+        )
+
+    def test_match_reports_start_and_reasons(self):
+        pos, detail = self.merger.find_anchor_match(
+            "## Groups\nWe begin our study", "## Groups\nWe begin our study"
+        )
+        assert pos == 0
+        assert "start" in detail
+
+        pos, detail = self.merger.find_anchor_match("a" * 50001, "z" * 30)
+        assert pos == -1
+        assert "skipped" in detail
+
+        pos, detail = self.merger.find_anchor_match(
+            "The beginning here", "xxxxxxxxxg herx"
+        )
+        assert pos == -1
+        assert "nearest" in detail
+
+    def test_start_anchor_logs_info_not_warning(self, caplog, monkeypatch):
+        merger, _ = make_merger(
+            monkeypatch,
+            json.dumps(
+                {
+                    "anchors": [
+                        {
+                            "anchor": "## Groups\nWe begin our study",
+                            "description": "",
+                            "suggested_title": "Groups",
+                        }
+                    ],
+                    "is_atomic": False,
+                }
+            ),
+            chunk_max_tokens=5,
+            chunk_min_threshold=1,
+        )
+        node = ChunkNode(
+            id="chunk_0001",
+            title="Root",
+            parent_path=[],
+            content="## Groups\nWe begin our study " + "x" * 200,
+        )
+        with caplog.at_level(logging.INFO, logger="pdf2skills"):
+            merger.recursive_peel(node)
+        assert not any(
+            "Could not find anchor" in r.message and r.levelname == "WARNING"
+            for r in caplog.records
+        )
+        assert any(
+            "chunk start" in r.message and r.levelname == "INFO"
+            for r in caplog.records
         )
 
 

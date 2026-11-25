@@ -68,6 +68,26 @@ describe('findAnchorPosition', () => {
     const content = '😀😀😀target string here';
     expect(merger.findAnchorPosition(content, 'target string here')).toBe(3);
   });
+
+  it('reports start and miss diagnostics', () => {
+    const start = merger.findAnchorMatch(
+      '## Groups\nWe begin our study',
+      '  ## Groups\nWe begin our study  ',
+    );
+    expect(start.pos).toBe(0);
+    expect(start.detail).toContain('start');
+
+    const miss = merger.findAnchorMatch('a'.repeat(50001), 'z'.repeat(30));
+    expect(miss.pos).toBe(-1);
+    expect(miss.detail).toContain('skipped');
+
+    const near = merger.findAnchorMatch(
+      'The beginning of section five is here',
+      'xxxxxxxx of section five is here',
+    );
+    expect(near.pos).toBe(-1);
+    expect(near.detail).toContain('nearest');
+  });
 });
 
 describe('recursivePeel', () => {
@@ -205,6 +225,28 @@ describe('recursivePeel', () => {
     expect(node.children[0].title).toBe('First Header');
     // second child: generic "Part" title + 1 header -> header title
     expect(node.children[1].title).toBe('Second Header');
+  });
+
+  it('does not warn when the anchor starts the chunk', async () => {
+    const logs: Array<{ msg: string; level?: string }> = [];
+    const content = '## Groups\nWe begin our study ' + 'x'.repeat(200);
+    const anchor = '## Groups\nWe begin our study';
+    const llm = mockLlm(() =>
+      JSON.stringify({
+        anchors: [{ anchor, description: '', suggested_title: 'Groups' }],
+        is_atomic: false,
+      }),
+    );
+    const merger = new TreeMerger(llm, {
+      config: { chunkMaxTokens: 5, chunkMinThreshold: 1 },
+      log: (msg, level) => logs.push({ msg, level }),
+    });
+    const node = new ChunkNode('chunk_0001', 'Root', [], content, 1, 2, 1);
+
+    await merger.recursivePeel(node);
+
+    expect(logs.some((l) => l.msg.includes('Could not find anchor'))).toBe(false);
+    expect(logs.some((l) => l.msg.includes('chunk start') && l.level === 'info')).toBe(true);
   });
 
   it('stops at max iterations', async () => {

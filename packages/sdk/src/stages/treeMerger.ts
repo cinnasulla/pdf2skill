@@ -200,31 +200,50 @@ export class TreeMerger {
    * (Levenshtein). Skips fuzzy matching for content over 50k chars and limits
    * the fuzzy search window to the first/last 20% for content over 20k chars.
    * All positions are code-point offsets (matching Python string semantics).
+   *
+   * Returns the position plus a short reason string for logs: a match at 0 is
+   * valid text but not a split point, and must not look like a miss.
    */
-  findAnchorPosition(content: string, anchor: string): number {
+  findAnchorMatch(content: string, anchor: string): { pos: number; detail: string } {
     anchor = anchor.trim();
-    if (!anchor) return -1;
+    if (!anchor) return { pos: -1, detail: 'empty anchor' };
 
     const cps = codePoints(content);
     const anchorCps = codePoints(anchor);
 
     // Exact search (code-point indexed)
     const exact = indexOfCp(cps, anchorCps);
-    if (exact !== -1) return exact;
+    if (exact !== -1) {
+      return {
+        pos: exact,
+        detail: exact === 0 ? 'exact match at chunk start' : 'exact match',
+      };
+    }
 
     const contentLen = cps.length;
     const anchorLen = anchorCps.length;
     if (contentLen > 50000) {
-      this.logFn(`Content too large (${contentLen} chars) for fuzzy anchor matching, skipping`);
-      return -1;
+      return {
+        pos: -1,
+        detail: `exact miss; fuzzy skipped (content ${contentLen} > 50000, anchor ${anchorLen})`,
+      };
+    }
+    if (anchorLen > contentLen) {
+      return {
+        pos: -1,
+        detail: `exact miss; anchor longer than content (content ${contentLen}, anchor ${anchorLen})`,
+      };
     }
 
     let bestPos = -1;
     let bestDistance = Infinity;
+    let nearestPos = -1;
+    let nearestDistance = Infinity;
     const threshold = Math.max(2, Math.trunc(anchorLen / 5));
 
     let searchRanges: Array<[number, number]>;
-    if (contentLen > 20000) {
+    const narrowed = contentLen > 20000;
+    if (narrowed) {
       searchRanges = [
         [0, Math.trunc(contentLen * 0.2)],
         [Math.trunc(contentLen * 0.8), contentLen],
@@ -238,6 +257,10 @@ export class TreeMerger {
       for (let i = rngStart; i < limit; i++) {
         const window = cps.slice(i, i + anchorLen);
         const dist = levenshteinCp(anchorCps, window);
+        if (dist < nearestDistance) {
+          nearestDistance = dist;
+          nearestPos = i;
+        }
         if (dist < bestDistance && dist <= threshold) {
           bestDistance = dist;
           bestPos = i;
@@ -245,7 +268,27 @@ export class TreeMerger {
       }
     }
 
-    return bestPos;
+    if (bestPos !== -1) {
+      const where = bestPos === 0 ? 'fuzzy match at chunk start' : 'fuzzy match';
+      return {
+        pos: bestPos,
+        detail: `${where} (distance ${bestDistance}, threshold ${threshold})`,
+      };
+    }
+
+    const rangeNote = narrowed ? 'first/last 20%' : 'full content';
+    const nearest =
+      nearestPos >= 0
+        ? `, nearest distance ${nearestDistance} at ${nearestPos}`
+        : '';
+    return {
+      pos: -1,
+      detail: `exact miss; fuzzy miss in ${rangeNote} (content ${contentLen}, anchor ${anchorLen}, threshold ${threshold}${nearest})`,
+    };
+  }
+
+  findAnchorPosition(content: string, anchor: string): number {
+    return this.findAnchorMatch(content, anchor).pos;
   }
 
   /** Recursively split a ChunkNode if it exceeds token limits. */
@@ -354,12 +397,20 @@ export class TreeMerger {
     const suggestedTitles: Array<string | null> = [];
     for (const anchorInfo of anchors) {
       const anchorText = (anchorInfo.anchor as string) ?? '';
-      const pos = this.findAnchorPosition(chunk.content, anchorText);
-      if (pos > 0) {
-        splitPositions.push(pos);
+      const match = this.findAnchorMatch(chunk.content, anchorText);
+      if (match.pos > 0) {
+        splitPositions.push(match.pos);
         suggestedTitles.push(((anchorInfo.suggested_title as string) ?? '') || null);
+      } else if (match.pos === 0) {
+        this.logFn(
+          `    Anchor at chunk start ignored: '${anchorText.slice(0, 30)}...' (${match.detail})`,
+          'info',
+        );
       } else {
-        this.logFn(`    Could not find anchor: '${anchorText.slice(0, 30)}...'`, 'warn');
+        this.logFn(
+          `    Could not find anchor: '${anchorText.slice(0, 30)}...' (${match.detail})`,
+          'warn',
+        );
       }
     }
 

@@ -208,48 +208,45 @@ class TreeMerger:
             or '\uff00' <= ch <= '\uffef'   # Fullwidth forms
         )
 
-    def find_anchor_position(self, content: str, anchor: str) -> int:
-        """Locate a sub-header anchor in the text using exact then fuzzy matching.
+    def find_anchor_match(self, content: str, anchor: str) -> tuple[int, str]:
+        """Locate an anchor and explain the outcome for logs.
 
-        Uses Levenshtein distance for fuzzy matching to handle minor LLM
-        variations.  Skips fuzzy matching for very large content (>50k
-        chars) to avoid O(n*m) CPU cost.
-
-        Args:
-            content: The full text to search in.
-            anchor: The anchor string to find (exact ``chunk_anchor_length``
-                chars from the LLM output).
-
-        Returns:
-            Character offset of the anchor, or ``-1`` if not found.
+        Returns ``(position, detail)``. A position of 0 is a valid text match
+        but not a usable split point; callers must distinguish it from -1.
         """
         anchor = anchor.strip()
         if not anchor:
-            return -1
+            return -1, "empty anchor"
 
         pos = content.find(anchor)
         if pos != -1:
-            return pos
+            return pos, "exact match at chunk start" if pos == 0 else "exact match"
 
         # Skip expensive fuzzy matching for very large content to prevent CPU DoS
         content_len = len(content)
         anchor_len = len(anchor)
         if content_len > 50000:
-            logger.warning(
-                f"Content too large ({content_len} chars) for fuzzy anchor matching, skipping"
+            return -1, (
+                f"exact miss; fuzzy skipped "
+                f"(content {content_len} > 50000, anchor {anchor_len})"
             )
-            return -1
+        if anchor_len > content_len:
+            return -1, (
+                f"exact miss; anchor longer than content "
+                f"(content {content_len}, anchor {anchor_len})"
+            )
 
         # Fuzzy match if exact match fails
         best_pos = -1
         best_distance = float('inf')
+        nearest_pos = -1
+        nearest_distance = float('inf')
         threshold = max(2, anchor_len // 5)
 
         # Limit search window to first and last 20% of content for large texts
-        if content_len > 20000:
-            search_start = 0
-            search_end = int(content_len * 0.2)
-            search_ranges = [(search_start, search_end), (int(content_len * 0.8), content_len)]
+        narrowed = content_len > 20000
+        if narrowed:
+            search_ranges = [(0, int(content_len * 0.2)), (int(content_len * 0.8), content_len)]
         else:
             search_ranges = [(0, content_len)]
 
@@ -257,11 +254,32 @@ class TreeMerger:
             for i in range(rng_start, min(rng_end, content_len - anchor_len + 1)):
                 window = content[i:i + anchor_len]
                 dist = levenshtein_distance(anchor, window)
+                if dist < nearest_distance:
+                    nearest_distance = dist
+                    nearest_pos = i
                 if dist < best_distance and dist <= threshold:
                     best_distance = dist
                     best_pos = i
 
-        return best_pos
+        if best_pos != -1:
+            where = "fuzzy match at chunk start" if best_pos == 0 else "fuzzy match"
+            return best_pos, f"{where} (distance {best_distance}, threshold {threshold})"
+
+        range_note = "first/last 20%" if narrowed else "full content"
+        nearest = (
+            f", nearest distance {nearest_distance} at {nearest_pos}"
+            if nearest_pos >= 0
+            else ""
+        )
+        return -1, (
+            f"exact miss; fuzzy miss in {range_note} "
+            f"(content {content_len}, anchor {anchor_len}, "
+            f"threshold {threshold}{nearest})"
+        )
+
+    def find_anchor_position(self, content: str, anchor: str) -> int:
+        """Locate a sub-header anchor in the text; -1 when unusable."""
+        return self.find_anchor_match(content, anchor)[0]
 
     def recursive_peel(self, chunk: ChunkNode, current_iteration: int = 2) -> list[ChunkNode]:
         """Recursively split a ChunkNode if it exceeds token limits.
@@ -414,13 +432,20 @@ Return ONLY the JSON object. No prose."""
         suggested_titles = []
         for anchor_info in anchors:
             anchor_text = anchor_info.get("anchor", "")
-            pos = self.find_anchor_position(chunk.content, anchor_text)
+            pos, detail = self.find_anchor_match(chunk.content, anchor_text)
             if pos > 0:
                 split_positions.append(pos)
                 suggested_titles.append(anchor_info.get("suggested_title", ""))
                 logger.info(f"    Found anchor at position {pos}: '{anchor_text[:30]}...'")
+            elif pos == 0:
+                logger.info(
+                    f"    Anchor at chunk start ignored: "
+                    f"'{anchor_text[:30]}...' ({detail})"
+                )
             else:
-                logger.warning(f"    Could not find anchor: '{anchor_text[:30]}...'")
+                logger.warning(
+                    f"    Could not find anchor: '{anchor_text[:30]}...' ({detail})"
+                )
 
         split_positions.append(len(chunk.content))
         # Anchor i's title describes the segment STARTING at anchor i, so the
