@@ -25,7 +25,9 @@ PDF ──► MinerU ──► Chunking ──► Peeling ──► Skill Engine
 - Stage 1 (MinerU)：调用 MinerU（remote API 或 local Gradio）将 PDF 转为 Markdown
 - Stage 2 (Chunking)：LLM 分析全文目录结构，生成语义分块策略
 - Stage 3 (Peeling)：递归剥离超过阈值的大块（TOC 剥离），生成最终 chunk 树
-- Stage 4 (Skill Engine)：为每个 chunk 生成 SKILL.md 索引和参考文件（每次都重跑）
+- Stage 4 (Skill Engine)：生成 SKILL.md 索引和参考文件；入口每次都执行，内部按 chunk 细粒度续跑
+
+> PDF 如何一步步变成 Skill 包、每一阶段产出什么，见下文「PDF 如何变成 Skill」。
 
 ## 快速启动
 
@@ -79,7 +81,7 @@ cp .env.example .env
 # 编辑 .env，至少填一个 LLM Provider Key；remote MinerU 还需 MINERU_API_KEY
 ```
 
-输出在 `outputs/<任务名>/`。常用续跑命令：
+输出在 `--output` 指定的目录（默认 `outputs/`；交互式入口 `run_test.py` 默认 `outputs/<文件名>/`）。常用续跑命令：
 
 ```bash
 python main.py "path/to/book.pdf" --from-stage llm_chunking  # 保留 Stage 1，只重跑分块
@@ -148,6 +150,180 @@ python main.py "path/to/book.pdf" --restart
 - `pdf_conversion` / `--restart`：同时清空 `peeling_cache/`，避免旧 markdown 的剥离结果混入
 
 Stage 2 本身是一次 LLM 规划调用（失败重试一次），没有可切的中间进度；Stage 3 的 Peeling 才按子树缓存。
+
+## PDF 如何变成 Skill
+
+一句话概括：**PDF 先被 MinerU 转成带标题层级的 Markdown，再由 LLM 按章节切成 base chunks，然后递归剥离成叶子 chunk 树，最后为每个叶子生成标签和引用文件，汇总成 `SKILL.md`。**
+
+```text
+book.pdf
+  │  Stage 1  MinerU：PDF → Markdown（公式/表格/图片保留）
+  ▼
+full.md + images/
+  │  Stage 2  LLM 只看标题树，决定章级切分行号
+  ▼
+full_chunks_original/           # 3~6 个 base chunks（按行号切）
+  │  Stage 3  超限的 base chunk 用 LLM 找子标题锚点，递归切分
+  ▼
+full_chunks/
+  ├── chunks/chunk_0001.md …    # 最终叶子 chunk
+  ├── chunks_index.json         # 文件、标题、token 估算
+  └── tree.json                 # 完整父子层级
+  │  Stage 4  为每个叶子打标签，生成引用文件与主索引
+  ▼
+generated_skills/
+  ├── SKILL.md                  # name + description + Overview + Reference Guide
+  └── references/chunk_0001.md …# 每个叶子一份，可被 Skill 直接引用
+```
+
+### Stage 1：PDF → Markdown
+
+MinerU 负责把版式复杂的 PDF 还原成 Markdown，尽量保留：
+
+- 章节标题（Markdown `#` 层级，供 Stage 2 识别结构）
+- 公式、表格、代码块
+- 图片（落到 `images/`，并在 Markdown 中保留引用）
+
+两种模式：
+
+- **remote**：先检查页数；超过 `page_limit` 时按 `min(page_limit, 200)` 页拆成 `splits/*_partNN.pdf`，逐份请求签名上传地址、上传、轮询结果（约 10 秒一次，最长 30 分钟），下载结果 ZIP，解压后优先取 `full.md`，再把各分段的 Markdown 用 `---` 和 `# Part N` 拼回一个 `full.md`。
+- **local**：直接调用自部署的 MinerU Gradio 服务，不分页拆分；结果 ZIP 同样解压为 `full.md + images/`。
+
+Markdown 输入（Web/SDK 支持）会跳过 MinerU，直接写入 `input.md` 并标记 Stage 1 完成。Stage 1 结束后 checkpoint 只记一个 `md_file`；只要 `full.md` 还在，下次运行不会重新解析。
+
+### Stage 2：Markdown → base chunks
+
+这一阶段**不把全文塞给 LLM**，而是先在本地提取 Markdown 标题树：
+
+```text
+[Line 1] # 深入理解计算机系统
+[Line 18] ## 第 1 章 计算机系统漫游
+[Line 240] ## 第 2 章 信息的表示和处理
+[Line 610] ### 2.1 信息存储
+...
+```
+
+把标题树、总行数、总字符数交给 LLM，让它返回关键字段：
+
+```json
+{
+  "chapter_splits": [1, 18, 240, 610, 980],
+  "toc_range": [2, 17]
+}
+```
+
+本地随后按这些行号切出若干 **base chunks**（通常 3~6 个），保存到 `full_chunks_original/`，同时写入 checkpoint 的 `base_chunks`。TOC 范围内的 chunk 会被标记为 `is_atomic`，避免后续被切碎。
+
+关键点：
+
+- 切分单位是**章节/逻辑段**，不是固定字数窗口。
+- LLM 失败会重试一次；仍失败则退化为“每约 2000 行切一块”的均匀切分。
+- 退化切分**不会写 Stage 2 checkpoint**，下次运行会重新尝试 LLM 规划。
+- 每个 base chunk 记录 `start_line`、`end_line`、`content`；正文不会丢行。
+
+### Stage 3：base chunk → 叶子 chunk 树（Peeling）
+
+Stage 2 的块可能仍然很大（一整章、附录、习题集），Stage 3 负责递归“剥”到可管理的大小。
+
+对每个 chunk：
+
+1. 用加权估算 token：CJK 字符约 1 token/字，其他字符约 4 字符/token。
+2. 不超过 `chunk_max_tokens`（默认 10,000）→ 直接作为叶子。
+3. 已标记 atomic（TOC 由 Stage 2 强制保护；习题、证明、代码块等由 Stage 3 的 LLM 判断）→ 不再切分。
+4. 超过上限 → 把 chunk 前 40,000 字符交给 LLM，要求给出 2~5 个切分锚点（每段约 30 个字符）或声明 `is_atomic`。
+5. 在原文中定位锚点：先精确匹配；失败则用 Levenshtein 模糊匹配（允许少量标点/空格差异）。
+6. 按锚点位置切分；小于 `chunk_min_threshold`（默认 1,000 字符）的碎片与相邻块合并。
+7. 对每个子块递归执行 1~6，直到成为叶子；最多 `chunk_max_iterations`（默认 5）层。
+8. 把叶子内容写成 `full_chunks/chunks/chunk_XXXX.md`，完整层级写入 `tree.json`，文件与 token 估算写入 `chunks_index.json`。
+
+最终结构类似：
+
+```text
+Document
+├── 第 1 章 计算机系统漫游
+│   ├── chunk_0001.md
+│   └── chunk_0002.md
+├── 第 2 章 信息的表示和处理
+│   ├── 2.1 信息存储
+│   │   ├── chunk_0003.md
+│   │   └── chunk_0004.md
+│   └── 2.2 整数表示
+│       └── chunk_0005.md
+└── 习题集（atomic）
+    └── chunk_0006.md
+```
+
+Peeling 是成本最高、也最值得缓存的阶段：
+
+- 每个成功剥离的子树按 `content + title + parent_path + 行号 + iteration + 配置` 计算 SHA-256，缓存到 `peeling_cache/<hash>.json`。
+- 再次运行（例如只改 Stage 2 切分）时，内容未变的子树直接复用缓存，不再调用 LLM。
+- 只有“本次没有新增 LLM 错误”的子树才会写缓存；出错的块保持原样并记入 `peel_errors`，下次重试。
+- 只要 `peel_errors > 0`，Stage 3 就**不写 checkpoint**；下次运行会继续补齐，而不是把有错误的树当成完成。
+
+### Stage 4：叶子 chunk → Skill 包
+
+Stage 4 把“一棵 chunk 树”变成 Claude Agent Skill 可用的目录结构：
+
+1. **书级概览**：根据标题树生成 `Overview`，并提取一段可放进 frontmatter 的描述。
+2. **逐 chunk 打标签**：对每个叶子取前 2,000 字符，让 LLM 输出关键词/主题标签，例如 `进程 | 虚拟内存 | 地址翻译`。
+3. **写引用文件**：每个叶子生成 `references/chunk_XXXX.md`，带 frontmatter：
+
+```md
+---
+id: chunk_0003
+title: 2.1 信息存储
+parent_path: 深入理解计算机系统 > 第 2 章 信息的表示和处理
+start_line: 610
+end_line: 980
+---
+
+<该 chunk 的 Markdown 原文>
+```
+
+> Stage 3 的叶子沿用所属 base chunk 的行号范围，所以这里的 `start_line` / `end_line` 表示章节范围，不是叶子的精确起止行。
+
+4. **生成技能名**：Web/SDK 优先使用用户指定的输出名；否则让 LLM 生成 kebab-case 名称，再校验（小写字母/数字/中划线、≤64 字符、不能首尾或连续 `-`），失败则从书名转换，最后回退到时间戳。
+5. **汇总 SKILL.md**：
+
+```md
+---
+name: csapp-notes
+description: 深入理解计算机系统的结构化知识索引。Use this skill when...
+---
+
+# 深入理解计算机系统
+
+## Overview
+（书级概览）
+
+## Reference Guide
+- [深入理解计算机系统 > 第 1 章 计算机系统漫游 > chunk_0001](references/chunk_0001.md): 进程 | 编译系统 | 存储层次
+- [深入理解计算机系统 > 第 2 章 信息的表示和处理 > 2.1 信息存储](references/chunk_0003.md): 补码 | 字节序 | 位运算
+```
+
+同时会把 `images/` 复制到 `references/images/`，保证引用文件里的图片仍然可用。
+
+Stage 4 有独立的 `generated_skills/.checkpoint.json`：书级概览、每个 chunk 的标签、技能名分别记录。中途中断后重跑只会补齐缺失的 chunk；但如果 Stage 2/3 重跑导致树结构变化，这个子 checkpoint 会被清空，避免旧标签描述新内容。
+
+### 各阶段数据形态
+
+| 阶段 | 数据形态 | 谁在计算 | 断点粒度 |
+|------|----------|----------|----------|
+| 输入 | PDF 或 Markdown | 用户 | — |
+| Stage 1 | `full.md` + `images/` | MinerU | 整段 Markdown |
+| Stage 2 | 若干按行号切分的 base chunks（通常 3~6 个） | LLM（只看标题树） | 一次 LLM 规划 |
+| Stage 3 | 叶子 chunk 树 + `tree.json` | LLM（按超限块逐个剥离） | 按子树缓存，可逐块补齐 |
+| Stage 4 | `SKILL.md` + `references/*.md` | LLM（概览/标签/命名） | 按 chunk 的 summary + 引用文件 |
+
+### 续跑时到底重跑哪一段
+
+| 命令 | 保留 | 重跑/补齐 |
+|------|------|-----------|
+| `--from-stage llm_chunking` | Stage 1 的 `full.md`、`peeling_cache/` | Stage 2 规划；内容未变的子树复用缓存 |
+| `--from-stage tree_merging` | Stage 2 的 base chunks、缓存 | 只补齐尚未完成的 Peeling 子树 |
+| `--from-stage pdf_conversion` / `--restart` | 无（会清 Stage 1 产物与缓存） | 从 PDF 解析开始全部重跑 |
+
+浏览器端的 `resume()` 语义相同：任务存在 OPFS `jobs/<jobId>/` 中；如果 Stage 1 未完成或 `full.md` / `input.md` 已丢失，`resume()` 会拒绝执行，需要重新上传原文件；Markdown 存在时可直接从 Stage 2 之后继续。CLI 任务可先通过「从磁盘导入任务」复制到浏览器再续跑。
 
 ## 纯前端模式（SDK + 演示界面）
 
@@ -343,6 +519,8 @@ LOCAL_VLLM_BASE_URL="http://192.168.1.100:8000/v1"
 | `REQUEST_INTERVAL` | API 请求间隔（秒） | 1.0 |
 
 ## 输出结构
+
+下面以「每个任务一个目录」为例（Web 工作台和 `run_test.py` 默认如此）；`python main.py --output outputs` 会直接把 `outputs/` 当作当前任务目录。
 
 ```
 outputs/
