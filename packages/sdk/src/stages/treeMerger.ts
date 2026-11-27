@@ -1,6 +1,7 @@
 import type { LlmTransport } from './llmTransport';
 import { charCount, codePoints, levenshteinCp } from './levenshtein';
 import { ensureDir, writeText } from '../storage/opfs';
+import { loadPeelCache, peelCacheKey, savePeelCache } from './peelCache';
 
 export class ChunkNode {
   children: ChunkNode[] = [];
@@ -58,9 +59,11 @@ export interface TreeMergerConfig {
 export interface TreeMergerOptions {
   config?: Partial<TreeMergerConfig>;
   /** Progress callback: base-chunk index (1-based) / total. */
-  onProgress?: (idx: number, total: number, chunkId: string) => void;
+  onProgress?: (idx: number, total: number, chunkId: string, cached?: boolean) => void;
   /** Log sink for warnings/info (defaults to console). */
-  log?: (msg: string) => void;
+  log?: (msg: string, level?: 'info' | 'warn') => void;
+  /** Optional directory for per-subtree peel results (jobRoot/peeling_cache). */
+  cacheDir?: FileSystemDirectoryHandle;
 }
 
 export const DEFAULT_TREE_MERGER_CONFIG: TreeMergerConfig = {
@@ -88,21 +91,32 @@ const fmt = (n: number): string => n.toLocaleString('en-US');
 export class TreeMerger {
   readonly config: TreeMergerConfig;
   peelErrors = 0;
+  /** Number of LLM-triggering nodes restored from the cache. */
+  cacheHits = 0;
+  /** Number of subtrees persisted to the cache. */
+  cacheWrites = 0;
   private chunkCounter = 0;
   private readonly llm: LlmTransport;
-  private readonly onProgress?: (idx: number, total: number, chunkId: string) => void;
-  private readonly logFn: (msg: string) => void;
+  private readonly onProgress?: (
+    idx: number,
+    total: number,
+    chunkId: string,
+    cached?: boolean,
+  ) => void;
+  private readonly logFn: (msg: string, level?: 'info' | 'warn') => void;
+  private readonly cacheDir?: FileSystemDirectoryHandle;
 
   constructor(llm: LlmTransport, opts: TreeMergerOptions | Partial<TreeMergerConfig> = {}) {
     // Accept either a plain config patch (back-compat) or full options.
-    if ('config' in opts || 'onProgress' in opts || 'log' in opts) {
+    if ('config' in opts || 'onProgress' in opts || 'log' in opts || 'cacheDir' in opts) {
       const o = opts as TreeMergerOptions;
       this.config = { ...DEFAULT_TREE_MERGER_CONFIG, ...o.config };
       this.onProgress = o.onProgress;
-      this.logFn = o.log ?? console.log;
+      this.logFn = o.log ?? ((msg, level) => (level === 'warn' ? console.warn(msg) : console.log(msg)));
+      this.cacheDir = o.cacheDir;
     } else {
       this.config = { ...DEFAULT_TREE_MERGER_CONFIG, ...(opts as Partial<TreeMergerConfig>) };
-      this.logFn = console.log;
+      this.logFn = (msg, level) => (level === 'warn' ? console.warn(msg) : console.log(msg));
     }
     this.llm = llm;
   }
@@ -110,6 +124,51 @@ export class TreeMerger {
   private generateChunkId(): string {
     this.chunkCounter += 1;
     return `chunk_${String(this.chunkCounter).padStart(4, '0')}`;
+  }
+
+  /** Keep generated ids above an existing node id (manual/test-supplied trees). */
+  private ensureCounterAbove(id: string): void {
+    const match = /^chunk_(\d+)$/.exec(id);
+    if (match) this.chunkCounter = Math.max(this.chunkCounter, Number(match[1]));
+  }
+
+  private async persistPeelCache(
+    cacheKey: string | null,
+    chunk: ChunkNode,
+    errorsBefore: number,
+  ): Promise<void> {
+    if (!this.cacheDir || !cacheKey || this.peelErrors !== errorsBefore) return;
+    try {
+      await savePeelCache(this.cacheDir, cacheKey, chunk.toDict());
+      this.cacheWrites += 1;
+    } catch (e) {
+      this.logFn(`    Cache write failed for ${chunk.id}: ${e}`, 'warn');
+    }
+  }
+
+  /** Copy a cached subtree onto the current node, assigning fresh ids. */
+  private adoptCachedSubtree(target: ChunkNode, source: ChunkNode): void {
+    target.isAtomic = source.isAtomic;
+    target.children = source.children.map((child) =>
+      this.cloneCachedNode(child, [...target.parentPath, target.title]),
+    );
+  }
+
+  private cloneCachedNode(source: ChunkNode, parentPath: string[]): ChunkNode {
+    const copy = new ChunkNode(
+      this.generateChunkId(),
+      source.title,
+      parentPath,
+      source.content,
+      source.startLine,
+      source.endLine,
+      source.iteration,
+      source.isAtomic,
+    );
+    copy.children = source.children.map((child) =>
+      this.cloneCachedNode(child, [...parentPath, copy.title]),
+    );
+    return copy;
   }
 
   /**
@@ -141,31 +200,50 @@ export class TreeMerger {
    * (Levenshtein). Skips fuzzy matching for content over 50k chars and limits
    * the fuzzy search window to the first/last 20% for content over 20k chars.
    * All positions are code-point offsets (matching Python string semantics).
+   *
+   * Returns the position plus a short reason string for logs: a match at 0 is
+   * valid text but not a split point, and must not look like a miss.
    */
-  findAnchorPosition(content: string, anchor: string): number {
+  findAnchorMatch(content: string, anchor: string): { pos: number; detail: string } {
     anchor = anchor.trim();
-    if (!anchor) return -1;
+    if (!anchor) return { pos: -1, detail: 'empty anchor' };
 
     const cps = codePoints(content);
     const anchorCps = codePoints(anchor);
 
     // Exact search (code-point indexed)
     const exact = indexOfCp(cps, anchorCps);
-    if (exact !== -1) return exact;
+    if (exact !== -1) {
+      return {
+        pos: exact,
+        detail: exact === 0 ? 'exact match at chunk start' : 'exact match',
+      };
+    }
 
     const contentLen = cps.length;
     const anchorLen = anchorCps.length;
     if (contentLen > 50000) {
-      this.logFn(`Content too large (${contentLen} chars) for fuzzy anchor matching, skipping`);
-      return -1;
+      return {
+        pos: -1,
+        detail: `exact miss; fuzzy skipped (content ${contentLen} > 50000, anchor ${anchorLen})`,
+      };
+    }
+    if (anchorLen > contentLen) {
+      return {
+        pos: -1,
+        detail: `exact miss; anchor longer than content (content ${contentLen}, anchor ${anchorLen})`,
+      };
     }
 
     let bestPos = -1;
     let bestDistance = Infinity;
+    let nearestPos = -1;
+    let nearestDistance = Infinity;
     const threshold = Math.max(2, Math.trunc(anchorLen / 5));
 
     let searchRanges: Array<[number, number]>;
-    if (contentLen > 20000) {
+    const narrowed = contentLen > 20000;
+    if (narrowed) {
       searchRanges = [
         [0, Math.trunc(contentLen * 0.2)],
         [Math.trunc(contentLen * 0.8), contentLen],
@@ -179,6 +257,10 @@ export class TreeMerger {
       for (let i = rngStart; i < limit; i++) {
         const window = cps.slice(i, i + anchorLen);
         const dist = levenshteinCp(anchorCps, window);
+        if (dist < nearestDistance) {
+          nearestDistance = dist;
+          nearestPos = i;
+        }
         if (dist < bestDistance && dist <= threshold) {
           bestDistance = dist;
           bestPos = i;
@@ -186,11 +268,32 @@ export class TreeMerger {
       }
     }
 
-    return bestPos;
+    if (bestPos !== -1) {
+      const where = bestPos === 0 ? 'fuzzy match at chunk start' : 'fuzzy match';
+      return {
+        pos: bestPos,
+        detail: `${where} (distance ${bestDistance}, threshold ${threshold})`,
+      };
+    }
+
+    const rangeNote = narrowed ? 'first/last 20%' : 'full content';
+    const nearest =
+      nearestPos >= 0
+        ? `, nearest distance ${nearestDistance} at ${nearestPos}`
+        : '';
+    return {
+      pos: -1,
+      detail: `exact miss; fuzzy miss in ${rangeNote} (content ${contentLen}, anchor ${anchorLen}, threshold ${threshold}${nearest})`,
+    };
+  }
+
+  findAnchorPosition(content: string, anchor: string): number {
+    return this.findAnchorMatch(content, anchor).pos;
   }
 
   /** Recursively split a ChunkNode if it exceeds token limits. */
   async recursivePeel(chunk: ChunkNode, currentIteration = 2): Promise<ChunkNode[]> {
+    this.ensureCounterAbove(chunk.id);
     if (chunk.isAtomic) {
       this.logFn(`  [Atomic] ${chunk.title}`);
       return [chunk];
@@ -208,7 +311,40 @@ export class TreeMerger {
       return [chunk];
     }
 
-    console.log(
+    const errorsBefore = this.peelErrors;
+    let cacheKey: string | null = null;
+    if (this.cacheDir) {
+      try {
+        cacheKey = await peelCacheKey({
+          content: chunk.content,
+          title: chunk.title,
+          parentPath: chunk.parentPath,
+          startLine: chunk.startLine,
+          endLine: chunk.endLine,
+          iteration: currentIteration,
+          config: this.config,
+        });
+      } catch {
+        // crypto.subtle is unavailable on insecure origins (e.g. LAN HTTP).
+        // Peeling must still work; it just runs without cache reuse.
+        cacheKey = null;
+      }
+    }
+    if (this.cacheDir && cacheKey) {
+      const cached = await loadPeelCache(this.cacheDir, cacheKey);
+      if (cached) {
+        try {
+          this.adoptCachedSubtree(chunk, ChunkNode.fromDict(cached));
+          this.cacheHits += 1;
+          this.logFn(`  [Cache] ${chunk.title}`);
+          return collectLeaves(chunk);
+        } catch {
+          // Corrupt cache entry: discard it and peel normally.
+        }
+      }
+    }
+
+    console.debug(
       `  Peeling ${chunk.id} (iteration ${currentIteration}, ~${fmt(estimatedTokens)} tokens)...`,
     );
 
@@ -218,7 +354,7 @@ export class TreeMerger {
     try {
       const response = await this.llm.chat(prompt);
       if (!response || !response.trim()) {
-        this.logFn(`    Empty response from LLM for ${chunk.id}`);
+        this.logFn(`    Empty response from LLM for ${chunk.id}`, 'warn');
         this.peelErrors += 1;
         return [chunk];
       }
@@ -234,6 +370,7 @@ export class TreeMerger {
       if (result.is_atomic) {
         this.logFn(`  [Atomic] ${chunk.title} (AI decision)`);
         chunk.isAtomic = true;
+        await this.persistPeelCache(cacheKey, chunk, errorsBefore);
         return [chunk];
       }
 
@@ -245,12 +382,13 @@ export class TreeMerger {
       if ((e as Error).name === 'AbortError') throw e;
       const code = (e as { code?: string }).code;
       if (code && code !== 'LLM_PARSE' && code !== 'LLM_TIMEOUT') throw e;
-      this.logFn(`    Could not parse LLM response: ${e}`);
+      this.logFn(`    Could not parse LLM response: ${e}`, 'warn');
       this.peelErrors += 1;
       return [chunk];
     }
 
     if (anchors.length === 0) {
+      await this.persistPeelCache(cacheKey, chunk, errorsBefore);
       return [chunk];
     }
 
@@ -259,15 +397,20 @@ export class TreeMerger {
     const suggestedTitles: Array<string | null> = [];
     for (const anchorInfo of anchors) {
       const anchorText = (anchorInfo.anchor as string) ?? '';
-      const pos = this.findAnchorPosition(chunk.content, anchorText);
-      if (pos > 0) {
-        splitPositions.push(pos);
+      const match = this.findAnchorMatch(chunk.content, anchorText);
+      if (match.pos > 0) {
+        splitPositions.push(match.pos);
         suggestedTitles.push(((anchorInfo.suggested_title as string) ?? '') || null);
+      } else if (match.pos === 0) {
         this.logFn(
-          `    Found anchor at position ${pos}: '${anchorText.slice(0, 30)}...'`,
+          `    Anchor at chunk start ignored: '${anchorText.slice(0, 30)}...' (${match.detail})`,
+          'info',
         );
       } else {
-        this.logFn(`    Could not find anchor: '${anchorText.slice(0, 30)}...'`);
+        this.logFn(
+          `    Could not find anchor: '${anchorText.slice(0, 30)}...' (${match.detail})`,
+          'warn',
+        );
       }
     }
 
@@ -290,8 +433,10 @@ export class TreeMerger {
     const sortedTitles = combined.map((x) => x[1]);
 
     if (sortedPositions.length <= 2) {
+      await this.persistPeelCache(cacheKey, chunk, errorsBefore);
       return [chunk];
     }
+    this.logFn(`  [Split] ${chunk.id} → ${sortedPositions.length - 1} parts`);
 
     const rawChildChunks: Array<{ content: string; title: string }> = [];
     for (let i = 0; i < sortedPositions.length - 1; i++) {
@@ -367,6 +512,7 @@ export class TreeMerger {
     }
 
     chunk.children = childChunks;
+    await this.persistPeelCache(cacheKey, chunk, errorsBefore);
 
     return finalChunks;
   }
@@ -438,6 +584,8 @@ Return ONLY the JSON object. No prose.`;
   /** Peel all base chunks and assemble them under a master root. */
   async buildAndMerge(llmChunks: BaseChunkInput[]): Promise<ChunkNode> {
     this.peelErrors = 0;
+    this.cacheHits = 0;
+    this.cacheWrites = 0;
     const masterRoot = new ChunkNode('master', 'Document', []);
 
     for (let idx = 0; idx < llmChunks.length; idx++) {
@@ -473,9 +621,19 @@ Return ONLY the JSON object. No prose.`;
         isAtomic,
       );
 
+      const hitsBefore = this.cacheHits;
       await this.recursivePeel(node);
       masterRoot.children.push(node);
-      this.onProgress?.(idx + 1, llmChunks.length, node.id);
+      this.onProgress?.(
+        idx + 1,
+        llmChunks.length,
+        node.id,
+        this.cacheHits > hitsBefore,
+      );
+    }
+
+    if (this.cacheHits > 0) {
+      this.logFn(`  [Cache] reused ${this.cacheHits} peeled subtree(s)`);
     }
 
     return masterRoot;
@@ -566,6 +724,13 @@ tokens: ~${this.estimateTokens(chunk.content)}
 
     await writeText(outputDir, 'chunks_index.json', JSON.stringify(chunkIndex, null, 2));
   }
+}
+
+function collectLeaves(node: ChunkNode): ChunkNode[] {
+  if (node.children.length === 0) return [node];
+  const leaves: ChunkNode[] = [];
+  for (const child of node.children) leaves.push(...collectLeaves(child));
+  return leaves;
 }
 
 /** Code-point-indexed substring search. */

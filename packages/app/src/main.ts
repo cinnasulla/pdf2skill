@@ -6,8 +6,8 @@ import '@fontsource-variable/space-grotesk';
 import '@fontsource-variable/noto-sans-sc';
 import '@fontsource-variable/jetbrains-mono';
 import { checkHealth } from './api/backend';
-import { loadConfigUI, setupConfigTab } from './tabs/config';
-import { setupRunTab } from './tabs/run';
+import { hydrateConfigFromServer, loadConfigUI, setupConfigTab } from './tabs/config';
+import { refreshRunJobs, resumeJob, scrollLogToLatest, setupRunTab } from './tabs/run';
 import { refreshOutputs, setupOutputsTab } from './tabs/outputs';
 import { enhanceSelects } from './ui/dropdown';
 
@@ -30,6 +30,10 @@ function switchTab(tabId: string, focusTab = false): void {
     p.classList.toggle('active', p.id === 'panel-' + tabId);
   });
   if (tabId === 'outputs') void refreshOutputs().catch(() => {});
+  if (tabId === 'run') {
+    void refreshRunJobs().catch(() => {});
+    scrollLogToLatest();
+  }
 }
 
 const tabList = document.querySelector<HTMLElement>('.tabs');
@@ -90,7 +94,12 @@ async function init(): Promise<void> {
   console.log(`[pdf2skill] SDK v${VERSION} (pure frontend)`);
   setupConfigTab(pdf2skill);
   setupRunTab(pdf2skill);
-  setupOutputsTab(pdf2skill);
+  setupOutputsTab(pdf2skill, {
+    onResume: (jobId) => {
+      switchTab('run');
+      void resumeJob(jobId);
+    },
+  });
 
   void requestPersistentStorage();
 
@@ -99,6 +108,7 @@ async function init(): Promise<void> {
   window.addEventListener('pagehide', () => clearInterval(healthTimer));
 
   try {
+    await hydrateConfigFromServer();
     await loadConfigUI();
   } catch (e) {
     console.warn('[pdf2skill] config UI load failed', e);

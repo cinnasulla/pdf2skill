@@ -68,6 +68,26 @@ describe('findAnchorPosition', () => {
     const content = '😀😀😀target string here';
     expect(merger.findAnchorPosition(content, 'target string here')).toBe(3);
   });
+
+  it('reports start and miss diagnostics', () => {
+    const start = merger.findAnchorMatch(
+      '## Groups\nWe begin our study',
+      '  ## Groups\nWe begin our study  ',
+    );
+    expect(start.pos).toBe(0);
+    expect(start.detail).toContain('start');
+
+    const miss = merger.findAnchorMatch('a'.repeat(50001), 'z'.repeat(30));
+    expect(miss.pos).toBe(-1);
+    expect(miss.detail).toContain('skipped');
+
+    const near = merger.findAnchorMatch(
+      'The beginning of section five is here',
+      'xxxxxxxx of section five is here',
+    );
+    expect(near.pos).toBe(-1);
+    expect(near.detail).toContain('nearest');
+  });
 });
 
 describe('recursivePeel', () => {
@@ -207,6 +227,28 @@ describe('recursivePeel', () => {
     expect(node.children[1].title).toBe('Second Header');
   });
 
+  it('does not warn when the anchor starts the chunk', async () => {
+    const logs: Array<{ msg: string; level?: string }> = [];
+    const content = '## Groups\nWe begin our study ' + 'x'.repeat(200);
+    const anchor = '## Groups\nWe begin our study';
+    const llm = mockLlm(() =>
+      JSON.stringify({
+        anchors: [{ anchor, description: '', suggested_title: 'Groups' }],
+        is_atomic: false,
+      }),
+    );
+    const merger = new TreeMerger(llm, {
+      config: { chunkMaxTokens: 5, chunkMinThreshold: 1 },
+      log: (msg, level) => logs.push({ msg, level }),
+    });
+    const node = new ChunkNode('chunk_0001', 'Root', [], content, 1, 2, 1);
+
+    await merger.recursivePeel(node);
+
+    expect(logs.some((l) => l.msg.includes('Could not find anchor'))).toBe(false);
+    expect(logs.some((l) => l.msg.includes('chunk start') && l.level === 'info')).toBe(true);
+  });
+
   it('stops at max iterations', async () => {
     let calls = 0;
     const llm = mockLlm(() => {
@@ -227,6 +269,97 @@ describe('recursivePeel', () => {
     const big = leaves.find((l) => l.content.length === 60000)!;
     expect(big.iteration).toBe(2);
     expect(big.children.length).toBe(0);
+  });
+});
+
+describe('peeling cache', () => {
+  const cacheConfig = { chunkMinThreshold: 1, chunkMaxTokens: 1000 };
+
+  function cacheFixture(): { content: string; anchors: Array<Record<string, string>> } {
+    const secA = '# Section A\n\n' + 'alpha content '.repeat(200);
+    const secB = '# Section B\n\n' + 'beta content '.repeat(200);
+    const secC = '# Section C\n\n' + 'gamma content '.repeat(200);
+    return {
+      content: secA + secB + secC,
+      anchors: [
+        { anchor: '# Section B\n\nbeta content beta c', description: '', suggested_title: 'Section B' },
+        { anchor: '# Section C\n\ngamma content gamma ', description: '', suggested_title: 'Section C' },
+      ],
+    };
+  }
+
+  it('reuses a cached subtree without calling the LLM and assigns fresh ids', async () => {
+    const { content, anchors } = cacheFixture();
+    const jobRoot = mockOpfsRoot();
+    const cacheDir = await ensureDir(jobRoot, 'peeling_cache');
+
+    const llm1 = mockLlm(() => JSON.stringify({ anchors, is_atomic: false }));
+    const merger1 = new TreeMerger(llm1, { config: cacheConfig, cacheDir });
+    const root1 = await merger1.buildAndMerge([{ content, start_line: 1, end_line: 100 }]);
+    expect(root1.children[0].children.length).toBe(3);
+    expect(merger1.cacheWrites).toBeGreaterThan(0);
+
+    const progress: boolean[] = [];
+    const llm2 = mockLlm(() => {
+      throw new Error('cache miss');
+    });
+    const merger2 = new TreeMerger(llm2, {
+      config: cacheConfig,
+      cacheDir,
+      onProgress: (_idx, _total, _id, cached) => progress.push(!!cached),
+    });
+    const root2 = await merger2.buildAndMerge([{ content, start_line: 1, end_line: 100 }]);
+
+    expect(llm2.prompts).toEqual([]);
+    expect(merger2.cacheHits).toBeGreaterThan(0);
+    expect(root2.children[0].children.length).toBe(3);
+    expect(progress).toEqual([true]);
+
+    const ids = [root2.children[0].id, ...root2.children[0].children.map((c) => c.id)];
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(root2.children[0].children[1].parentPath).toEqual(['Section A']);
+    expect(root2.children[0].children[1].content).toBe(root1.children[0].children[1].content);
+  });
+
+  it('does not cache a subtree that had peel errors', async () => {
+    const { content } = cacheFixture();
+    const jobRoot = mockOpfsRoot();
+    const cacheDir = await ensureDir(jobRoot, 'peeling_cache');
+
+    const broken = mockLlm(() => 'not json at all {{{');
+    const merger1 = new TreeMerger(broken, { config: cacheConfig, cacheDir });
+    await merger1.buildAndMerge([{ content, start_line: 1, end_line: 100 }]);
+    expect(merger1.peelErrors).toBe(1);
+    expect(merger1.cacheWrites).toBe(0);
+
+    const healthy = mockLlm(() => JSON.stringify({ anchors: [], is_atomic: false }));
+    const merger2 = new TreeMerger(healthy, { config: cacheConfig, cacheDir });
+    await merger2.buildAndMerge([{ content, start_line: 1, end_line: 100 }]);
+    expect(healthy.prompts.length).toBe(1);
+    expect(merger2.cacheHits).toBe(0);
+  });
+
+  it('invalidates the cache when peeling config changes', async () => {
+    const jobRoot = mockOpfsRoot();
+    const cacheDir = await ensureDir(jobRoot, 'peeling_cache');
+    const content = 'x'.repeat(60000);
+
+    const llm1 = mockLlm(() => JSON.stringify({ anchors: [], is_atomic: false }));
+    const merger1 = new TreeMerger(llm1, {
+      config: { chunkMaxTokens: 1000, chunkMinThreshold: 1 },
+      cacheDir,
+    });
+    await merger1.buildAndMerge([{ content }]);
+    expect(merger1.cacheWrites).toBe(1);
+
+    const llm2 = mockLlm(() => JSON.stringify({ anchors: [], is_atomic: false }));
+    const merger2 = new TreeMerger(llm2, {
+      config: { chunkMaxTokens: 1000, chunkMinThreshold: 1000 },
+      cacheDir,
+    });
+    await merger2.buildAndMerge([{ content }]);
+    expect(llm2.prompts.length).toBe(1);
+    expect(merger2.cacheHits).toBe(0);
   });
 });
 
